@@ -17,6 +17,7 @@ triton_image = (
     )
     .add_local_python_source(
         "modal_env",
+        "study_pytest_plugin",
         "kernels",
         "tests",
     )
