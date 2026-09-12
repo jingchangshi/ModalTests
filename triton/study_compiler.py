@@ -5,6 +5,8 @@ stage IR and compiler diagnostics, records structured metadata/timing, and only
 copies an immutable tarball to the Modal Volume after compilation has stopped.
 """
 
+import json
+
 from modal_env import app, artifacts, triton_image
 
 
@@ -42,14 +44,12 @@ def study(test_path: str, detail: str = "stage"):
             "TRITON_KERNEL_DUMP": "1",
             "TRITON_DUMP_DIR": str(dump_dir),
             "TRITON_STUDY_RESULTS_DIR": str(results_dir),
-            # Pass-manager timing is cheap enough to retain in both modes.
             "MLIR_ENABLE_TIMING": "1",
             "LLVM_ENABLE_TIMING": "1",
         }
     )
 
     if detail == "pass":
-        # Full pass-boundary IR can be very large; keep it opt-in.
         env["MLIR_ENABLE_DUMP"] = "1"
         env["MLIR_DUMP_PATH"] = str(logs_dir / "mlir-pass-ir.log")
         env["LLVM_IR_ENABLE_DUMP"] = "1"
@@ -97,18 +97,25 @@ def study(test_path: str, detail: str = "stage"):
     if pipeline_file.exists():
         pipeline = json.loads(pipeline_file.read_text())
 
+    kernel_metrics = []
+    metrics_file = results_dir / "kernel_metrics.jsonl"
+    if metrics_file.exists():
+        kernel_metrics = [json.loads(line) for line in metrics_file.read_text().splitlines() if line.strip()]
+
     manifest = {
         "schema_version": 1,
         "run_id": run_id,
         "detail": detail,
         "test_path": test_path,
         "pytest_returncode": proc.returncode,
+        "status": "passed" if proc.returncode == 0 else "failed",
         "environment": environment,
         "pipeline": pipeline,
+        "kernel_metrics": kernel_metrics,
         "artifacts": artifact_inventory,
         "notes": {
             "cold_metric": "Python wall time from first Triton launch through CUDA synchronize; includes JIT, module load, launch, and first execution.",
-            "warm_metric": "triton.testing.do_bench after compilation; measures warm launch/execution.",
+            "warm_metric": "triton.testing.do_bench after the first launch in the same process; the in-process JIT kernel cache is warm even though TRITON_ALWAYS_COMPILE forces compiler disk-cache misses for new compilations.",
             "pass_timing": "MLIR/LLVM timing output is preserved in logs/compiler.log.",
         },
     }
@@ -127,9 +134,10 @@ def study(test_path: str, detail: str = "stage"):
 
     return {
         "run_id": run_id,
-        "status": "passed" if proc.returncode == 0 else "failed",
+        "status": manifest["status"],
         "archive": str(remote_archive.relative_to("/artifacts")),
         "artifact_count": len(artifact_inventory),
+        "compiler_log": "logs/compiler.log",
     }
 
 
