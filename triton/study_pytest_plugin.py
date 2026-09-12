@@ -1,8 +1,4 @@
-"""Pytest-side instrumentation for Triton compiler experiments.
-
-This module is imported inside the subprocess that actually JIT-compiles kernels,
-so Triton runtime hooks and timing measurements observe the real compilation.
-"""
+"""Pytest-side instrumentation for Triton compiler experiments."""
 
 import json
 import os
@@ -28,29 +24,42 @@ def pytest_sessionstart(session):
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     props = torch.cuda.get_device_properties(0)
-    environment = {
-        "python": platform.python_version(),
-        "torch": torch.__version__,
-        "triton": triton.__version__,
-        "cuda": torch.version.cuda,
-        "gpu": torch.cuda.get_device_name(0),
-        "compute_capability": [props.major, props.minor],
-        "gpu_memory_bytes": props.total_memory,
-    }
-    _write_json("environment.json", environment)
+    _write_json(
+        "environment.json",
+        {
+            "python": platform.python_version(),
+            "torch": torch.__version__,
+            "triton": triton.__version__,
+            "cuda": torch.version.cuda,
+            "gpu": torch.cuda.get_device_name(0),
+            "compute_capability": [props.major, props.minor],
+            "gpu_memory_bytes": props.total_memory,
+        },
+    )
 
     stages_seen = []
 
-    def inspect_stages(_backend, stages, options, language, capability):
-        record = {
-            "stages": list(stages.keys()),
-            "language": str(language),
-            "capability": str(capability),
-            "options": repr(options),
-        }
+    def inspect_stages(*args):
+        # Triton's hook is also called with no arguments when its value is
+        # incorporated into the compiler cache key. Return a stable key then.
+        if not args:
+            return "modal-triton-study-v1"
+
+        if len(args) != 5:
+            record = {"warning": "unexpected add_stages_inspection_hook signature", "argc": len(args)}
+        else:
+            _backend, stages, options, language, capability = args
+            record = {
+                "stages": list(stages.keys()),
+                "language": str(language),
+                "capability": str(capability),
+                "options": repr(options),
+            }
+
         if record not in stages_seen:
             stages_seen.append(record)
             _write_json("pipeline.json", stages_seen)
+        return None
 
     runtime_knobs = getattr(getattr(triton, "knobs", None), "runtime", None)
     if runtime_knobs is not None and hasattr(runtime_knobs, "add_stages_inspection_hook"):
@@ -71,19 +80,16 @@ def pytest_runtest_teardown(item, nextitem):
     if start_ns is None:
         return
     elapsed_ms = (time.perf_counter_ns() - start_ns) / 1_000_000.0
-    path = RESULTS_DIR / "pytest_wall_times.jsonl"
-    with path.open("a") as f:
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    with (RESULTS_DIR / "pytest_wall_times.jsonl").open("a") as f:
         f.write(json.dumps({"test": item.nodeid, "wall_ms": elapsed_ms}) + "\n")
 
 
 @pytest.fixture
 def triton_study_metrics():
-    """Return a helper that appends structured kernel metrics to JSONL."""
-
     def record(**metrics):
         RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        path = RESULTS_DIR / "kernel_metrics.jsonl"
-        with path.open("a") as f:
+        with (RESULTS_DIR / "kernel_metrics.jsonl").open("a") as f:
             f.write(json.dumps(metrics, sort_keys=True) + "\n")
 
     return record
