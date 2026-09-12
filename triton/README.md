@@ -1,5 +1,7 @@
 # Triton GPU compiler studies on Modal
 
+> 供自动化 agent 阅读的工作区说明（环境、运行命令、注意事项、已验证基线）见仓库根的 [AGENTS.md](../AGENTS.md)。
+
 This directory has two intentionally separate workflows:
 
 - `run_test.py`: correctness/regression execution and stage artifact capture.
