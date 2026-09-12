@@ -1,3 +1,4 @@
+import os
 import time
 
 import torch
@@ -29,35 +30,56 @@ def triton_add(x: torch.Tensor, y: torch.Tensor):
     return output
 
 
-def test_add(triton_study_metrics):
-    # Input construction is intentionally outside the cold-JIT interval.
+def _record_study_metrics(**metrics):
+    results_dir = os.environ.get("TRITON_STUDY_RESULTS_DIR")
+    if not results_dir:
+        return
+
+    import json
+    from pathlib import Path
+
+    path = Path(results_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    with (path / "kernel_metrics.jsonl").open("a") as f:
+        f.write(json.dumps(metrics, sort_keys=True) + "\n")
+
+
+def test_add():
     x = torch.randn(N_ELEMENTS, device="cuda", dtype=torch.float32)
     y = torch.randn(N_ELEMENTS, device="cuda", dtype=torch.float32)
 
-    torch.cuda.synchronize()
-    cold_start = time.perf_counter_ns()
+    study_mode = bool(os.environ.get("TRITON_STUDY_RESULTS_DIR"))
+
+    if study_mode:
+        torch.cuda.synchronize()
+        cold_start = time.perf_counter_ns()
+
     actual = triton_add(x, y)
-    torch.cuda.synchronize()
-    cold_ms = (time.perf_counter_ns() - cold_start) / 1_000_000.0
+
+    if study_mode:
+        torch.cuda.synchronize()
+        cold_ms = (time.perf_counter_ns() - cold_start) / 1_000_000.0
+    else:
+        cold_ms = None
 
     expected = x + y
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
-
-    # The kernel is already compiled here. do_bench therefore measures warm
-    # launch/execution rather than the JIT path.
-    warm_ms = triton.testing.do_bench(lambda: triton_add(x, y))
     max_error = (actual - expected).abs().max().item()
 
-    triton_study_metrics(
-        kernel="add_kernel",
-        n_elements=N_ELEMENTS,
-        dtype=str(x.dtype),
-        block_size=BLOCK_SIZE,
-        cold_jit_and_first_run_ms=cold_ms,
-        warm_runtime_ms=float(warm_ms),
-        max_error=max_error,
-    )
+    if study_mode:
+        # The JITFunction has already produced its in-process compiled kernel.
+        # Repeated calls reuse it; do_bench measures the warm launch/execution path.
+        warm_ms = float(triton.testing.do_bench(lambda: triton_add(x, y)))
+        _record_study_metrics(
+            kernel="add_kernel",
+            n_elements=N_ELEMENTS,
+            dtype=str(x.dtype),
+            block_size=BLOCK_SIZE,
+            cold_jit_and_first_run_ms=cold_ms,
+            warm_runtime_ms=warm_ms,
+            max_error=max_error,
+        )
+        print(f"cold JIT + first run: {cold_ms:.3f} ms")
+        print(f"warm runtime: {warm_ms:.6f} ms")
 
-    print(f"cold JIT + first run: {cold_ms:.3f} ms")
-    print(f"warm runtime: {warm_ms:.6f} ms")
     print(f"max error: {max_error}")
