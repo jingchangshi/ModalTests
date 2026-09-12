@@ -1,5 +1,6 @@
 """Pytest-side instrumentation for Triton compiler experiments."""
 
+import hashlib
 import json
 import os
 import platform
@@ -38,24 +39,28 @@ def pytest_sessionstart(session):
     )
 
     stages_seen = []
+    hook_key = "modal-triton-study-pipeline-inspection-v2"
+    hook_hash = hashlib.sha256(hook_key.encode("utf-8")).hexdigest()
 
-    def inspect_stages(*args):
-        # Triton's hook is also called with no arguments when its value is
-        # incorporated into the compiler cache key. Return a stable key then.
-        if not args:
-            return "modal-triton-study-v1"
+    def inspect_stages_hook(self=None, stages=None, options=None, language=None, capability=None):
+        """Triton 3.8-compatible pipeline inspection hook.
 
-        if len(args) != 5:
-            record = {"warning": "unexpected add_stages_inspection_hook signature", "argc": len(args)}
-        else:
-            _backend, stages, options, language, capability = args
-            record = {
-                "stages": list(stages.keys()),
-                "language": str(language),
-                "capability": str(capability),
-                "options": repr(options),
-            }
+        Triton calls this hook in two distinct modes:
+        1. With no stage arguments, to obtain a stable (key, hash) pair used in
+           JIT/compiler cache keys.
+        2. With backend/stages/options/language/capability populated, to inspect
+           the concrete compilation pipeline.
+        """
+        if all(arg is None for arg in (stages, options, language, capability)):
+            return hook_key, hook_hash
 
+        record = {
+            "stages": list(stages.keys()) if hasattr(stages, "keys") else repr(stages),
+            "language": str(language),
+            "capability": str(capability),
+            "options": repr(options),
+            "backend": type(self).__name__ if self is not None else None,
+        }
         if record not in stages_seen:
             stages_seen.append(record)
             _write_json("pipeline.json", stages_seen)
@@ -63,7 +68,7 @@ def pytest_sessionstart(session):
 
     runtime_knobs = getattr(getattr(triton, "knobs", None), "runtime", None)
     if runtime_knobs is not None and hasattr(runtime_knobs, "add_stages_inspection_hook"):
-        runtime_knobs.add_stages_inspection_hook = inspect_stages
+        runtime_knobs.add_stages_inspection_hook = inspect_stages_hook
     else:
         _write_json(
             "pipeline.json",
