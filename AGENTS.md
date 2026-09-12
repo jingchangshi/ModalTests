@@ -17,8 +17,8 @@ modal/                          # 仓库根
     ├── study_compiler.py       # 主入口：编译研究运行（结构化元数据 + 产物打包）
     ├── run_test.py             # 辅助入口：简单回归运行（较少使用）
     ├── study_pytest_plugin.py  # pytest 插件：采集环境/pipeline/计时信息
-    ├── kernels/                # Triton kernel 源码（add.py, softmax.py）
-    ├── tests/                  # pytest 测试用例（test_add.py, test_softmax.py）
+    ├── kernels/                # Triton kernel 源码（add.py, softmax.py, fused_attention.py）
+    ├── tests/                  # pytest 测试用例（test_add.py, test_softmax.py, test_fused_attention.py）
     ├── README.md               # 面向人的说明（英文）
     └── triton-study-<run-id>/  # 从 Volume 下载回来的产物包（已 gitignore）
 ```
@@ -200,5 +200,31 @@ run `20260912-141700`，sm86：
 
 `tests/test_add.py`（98432 元素，BLOCK_SIZE=256），run `20260912-131330`：
 passed，max_error 0.0，cold ≈ 1665 ms，warm ≈ 0.0071 ms。
+
+`tests/test_fused_attention.py`（FA v2 前向，BATCH=1×N_HEADS=2×N_CTX=1024×HEAD_DIM=64 fp16
+causal，教程 06 v3.8.0 移植），run `20260912-154624`，sm86：
+
+- status: passed，max_error ≈ 4.88e-04（教程同款 atol=1e-2，fp16 精度正常）
+- cold ≈ 29747 ms（autotuner 实际编译了 6 个 config：warps∈{4,8} × stages∈{2,3,4}，
+  其中 4 个落盘完整 dumps，1 个空目录属正常——编译失败被 autotuner 剔除）；warm ≈ 0.0225 ms
+- 实测性能 ≈ 11.9 TFLOPS（A10 fp16 tensor core 理论峰值 125 TFLOPS 的 ~10%，
+  小 batch+短序列的正常水平，教程 benchmark 用 batch4×heads32 才能到 100+ TFLOPS）
+- 编译链证据（sm86 路径）：TTGIR 含 `ttg.nvidia_mma{versionMajor = 2, instrShape = [16, 8]}`
+  + `ttg.async_copy_global_to_local`（cp.async 软件流水）；PTX 含
+  `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32`（64 或 128 条，随 BLOCK_N 不同）、
+  `cp.async.*`×36、`ex2.approx`×36、813 个 b32 寄存器、`.reqntid 256`；SASS 含
+  `HMMA.16816.`×64 + `LDGSTS.E.BYPASS.128`×16
+- sm86 适配要点（与教程的差异）：
+  - `supports_host_descriptor()` 需要 cc≥9，Ampere 走 fallback：直接传张量指针，
+    kernel 内 `_maybe_make_tensor_desc` 创建 device 端 descriptor，由 TTIR pass
+    `rewrite_tensor_descriptor_to_pointer`（capability<9 门控）降为普通指针运算；
+    device 端 descriptor 仍需 `triton.set_allocator` 提供 global scratch。
+  - `tl.range(..., warp_specialize=...)` 只在 Blackwell pipeline 生效，sm86 上是
+    no-op（仅设置一个 op attr），保留不影响。
+  - 研究版去掉了教程的 backward/benchmark harness（perf_report）和 autograd
+    （`_attention` 是普通类而非 `torch.autograd.Function`），只保留前向。
+- FA 运行时间构成参考：pytest 总墙钟 31.2 s ≈ 6 次编译的 MLIR/LLVM pass 累计 12.8 s
+  （最贵：ConvertTritonGPUToLLVM 1.13 s、TritonGPUCoalesceAsyncCopy 0.76 s、
+  TritonGPURemoveLayoutConversions 0.55 s）+ ptxas×6 + autotuner bench 循环 + torch 导入。
 
 新用例跑完后建议把基线追加到本节。
