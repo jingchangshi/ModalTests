@@ -106,15 +106,19 @@ def _host_descriptor_pre_hook(nargs):
     nargs["desc_o"].block_shape = [BLOCK_M, HEAD_DIM]
 
 
-NUM_STAGES_OPTIONS = [2, 3, 4]
+# NUM_STAGES_OPTIONS = [2, 3, 4]
+NUM_STAGES_OPTIONS = [2]
 
 _tutorial_configs = [
     triton.Config({"BLOCK_M": BM, "BLOCK_N": BN}, num_stages=s, num_warps=w,
                   pre_hook=_host_descriptor_pre_hook)
-    for BM in [64, 128]
-    for BN in [32, 64, 128]
+    # for BM in [64, 128]
+    # for BN in [32, 64, 128]
+    for BM in [128]
+    for BN in [64]
     for s in NUM_STAGES_OPTIONS
-    for w in [4, 8]
+    # for w in [4, 8]
+    for w in [4]
 ]
 
 
