@@ -132,10 +132,10 @@ triton-study-<run-id>/
 │   ├── <kernel>.cubin       # ⑤ SASS 容器
 │   └── <kernel>.sass        # ⑥ 反汇编
 ├── results/
-│   ├── environment.json     # GPU/驱动/版本
+│   ├── environment.json     # CPU/GPU/版本等 run-level 静态环境信息
 │   ├── pipeline.json        # 编译 pipeline 阶段与 CUDAOptions（含 libdevice.10.bc 路径）
 │   ├── kernel_metrics.jsonl # 每行一个 kernel：cold/warm 计时、max_error、自定义字段
-│   └── pytest_wall_times.jsonl
+│   └── test_runtime.jsonl   # 每个 pytest case 的 wall time + 测试前后 loadavg
 └── logs/
     └── compiler.log         # pytest 全输出 + MLIR/LLVM pass timing 报告
 ```
@@ -145,6 +145,7 @@ triton-study-<run-id>/
 - `cold_jit_and_first_run_ms`：首次启动墙钟，含 JIT 编译 + CUDA 模块加载 + 首次执行。
 - `warm_runtime_ms`：`triton.testing.do_bench` 的热运行时间。
 - 编译各 pass 耗时看 `logs/compiler.log` 里的 "Pass execution timing report"。
+- CPU 型号、逻辑核数等静态宿主信息由 `study_pytest_plugin.py` 自动写入 `environment.json`；每个 testcase 前后的 1/5/15 分钟 loadavg 自动写入 `test_runtime.jsonl`。具体 kernel/test 不要重复采集这些基础设施信息。
 
 ## 6. 新增测试用例的固定套路
 

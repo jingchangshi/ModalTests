@@ -43,11 +43,17 @@ triton-study-<run-id>/
 │   ├── environment.json
 │   ├── pipeline.json
 │   ├── kernel_metrics.jsonl
-│   └── pytest_wall_times.jsonl
+│   └── test_runtime.jsonl
 └── logs/
     ├── compiler.log
     └── mlir-pass-ir.log       # pass detail only, when supported
 ```
+
+`environment.json` contains run-level static host/device metadata, including the CPU model, logical CPU count, hostname, machine architecture, GPU, CUDA, PyTorch, and Triton versions.
+
+`test_runtime.jsonl` contains per-pytest-case runtime context. Each record includes the pytest node id, wall time, and 1/5/15-minute load averages sampled immediately before and after the test. `normalized_loadavg_1m` is the 1-minute load average divided by the logical CPU count, which makes host-load comparisons more meaningful across servers with different CPU counts.
+
+Host metadata collection is implemented in `study_pytest_plugin.py`; individual kernels and test files do not need to collect or duplicate it.
 
 ## Timing semantics
 

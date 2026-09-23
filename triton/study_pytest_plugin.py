@@ -18,6 +18,40 @@ def _write_json(name, data):
     (RESULTS_DIR / name).write_text(json.dumps(data, indent=2, sort_keys=True))
 
 
+def _get_cpu_model():
+    """Return a stable CPU model string without spawning an external process."""
+    try:
+        with open("/proc/cpuinfo") as cpuinfo:
+            for line in cpuinfo:
+                if line.startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+
+    return platform.processor() or platform.machine()
+
+
+def _get_loadavg():
+    """Sample the current 1/5/15-minute load averages and normalized 1m load."""
+    try:
+        load1, load5, load15 = os.getloadavg()
+    except (AttributeError, OSError):
+        return {
+            "loadavg_1m": None,
+            "loadavg_5m": None,
+            "loadavg_15m": None,
+            "normalized_loadavg_1m": None,
+        }
+
+    cpu_count = os.cpu_count()
+    return {
+        "loadavg_1m": load1,
+        "loadavg_5m": load5,
+        "loadavg_15m": load15,
+        "normalized_loadavg_1m": load1 / cpu_count if cpu_count else None,
+    }
+
+
 def pytest_sessionstart(session):
     import torch
     import triton
@@ -35,6 +69,10 @@ def pytest_sessionstart(session):
             "gpu": torch.cuda.get_device_name(0),
             "compute_capability": [props.major, props.minor],
             "gpu_memory_bytes": props.total_memory,
+            "cpu_model": _get_cpu_model(),
+            "logical_cpu_count": os.cpu_count(),
+            "hostname": platform.node(),
+            "machine": platform.machine(),
         },
     )
 
@@ -77,6 +115,7 @@ def pytest_sessionstart(session):
 
 
 def pytest_runtest_setup(item):
+    item._triton_study_load_before = _get_loadavg()
     item._triton_study_start_ns = time.perf_counter_ns()
 
 
@@ -84,10 +123,18 @@ def pytest_runtest_teardown(item, nextitem):
     start_ns = getattr(item, "_triton_study_start_ns", None)
     if start_ns is None:
         return
+
     elapsed_ms = (time.perf_counter_ns() - start_ns) / 1_000_000.0
+    record = {
+        "test": item.nodeid,
+        "wall_ms": elapsed_ms,
+        "load_before": getattr(item, "_triton_study_load_before", {}),
+        "load_after": _get_loadavg(),
+    }
+
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    with (RESULTS_DIR / "pytest_wall_times.jsonl").open("a") as f:
-        f.write(json.dumps({"test": item.nodeid, "wall_ms": elapsed_ms}) + "\n")
+    with (RESULTS_DIR / "test_runtime.jsonl").open("a") as f:
+        f.write(json.dumps(record, sort_keys=True) + "\n")
 
 
 @pytest.fixture
