@@ -100,22 +100,37 @@ def study(test_path: str, detail: str = "stage"):
     kernel_metrics = []
     metrics_file = results_dir / "kernel_metrics.jsonl"
     if metrics_file.exists():
-        kernel_metrics = [json.loads(line) for line in metrics_file.read_text().splitlines() if line.strip()]
+        kernel_metrics = [
+            json.loads(line)
+            for line in metrics_file.read_text().splitlines()
+            if line.strip()
+        ]
+
+    test_runtime = []
+    test_runtime_file = results_dir / "test_runtime.jsonl"
+    if test_runtime_file.exists():
+        test_runtime = [
+            json.loads(line)
+            for line in test_runtime_file.read_text().splitlines()
+            if line.strip()
+        ]
 
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": run_id,
         "detail": detail,
         "test_path": test_path,
         "pytest_returncode": proc.returncode,
         "status": "passed" if proc.returncode == 0 else "failed",
         "environment": environment,
+        "test_runtime": test_runtime,
         "pipeline": pipeline,
         "kernel_metrics": kernel_metrics,
         "artifacts": artifact_inventory,
         "notes": {
             "cold_metric": "Python wall time from first Triton launch through CUDA synchronize; includes JIT, module load, launch, and first execution.",
             "warm_metric": "triton.testing.do_bench after the first launch in the same process; the in-process JIT kernel cache is warm even though TRITON_ALWAYS_COMPILE forces compiler disk-cache misses for new compilations.",
+            "host_load": "Linux load averages are sampled by the pytest plugin immediately before and after each test case; normalized_loadavg_1m divides the 1-minute load average by the logical CPU count.",
             "pass_timing": "MLIR/LLVM timing output is preserved in logs/compiler.log.",
         },
     }
