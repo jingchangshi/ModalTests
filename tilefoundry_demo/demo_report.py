@@ -14,10 +14,23 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# The two inventory observations, named for what they actually observe. Version 1 called
+# them ``before_install``/``after_install``, which described a phase boundary neither one
+# sits on: both are taken in a container where installation already happened. The first
+# runs as soon as the process starts, the second after the kernel has been built and run,
+# so a build that writes into the installed tree is caught.
+PHASE_POST_IMAGE_BUILD = "post_image_build"
+PHASE_POST_EXECUTION = "post_execution"
+INVENTORY_PHASES = (PHASE_POST_IMAGE_BUILD, PHASE_POST_EXECUTION)
+
+# Schema 1 manifests stay readable: their phase keys are mapped onto the names above.
+LEGACY_PHASE_NAMES = {"before_install": PHASE_POST_IMAGE_BUILD, "after_install": PHASE_POST_EXECUTION}
 
 STATUS_NOT_RUN = "NOT_RUN"
 STATUS_PASS = "PASS"
@@ -149,6 +162,9 @@ def evaluate_source_integrity(environment: dict) -> tuple[str, str]:
     files inside the uploaded tree, neither was fetched from an index, and the
     tree on disk still matches the inventory that was digested before upload.
     """
+    provenance = environment.get("provenance_failures")
+    if isinstance(provenance, list) and provenance:
+        return STATUS_FAIL, f"the installed packages are not the uploaded snapshot: {provenance[0]}"
     if environment.get("origin_inside_snapshot") is not True:
         return STATUS_FAIL, (
             "an installed package resolves outside the uploaded snapshot: "
@@ -161,10 +177,10 @@ def evaluate_source_integrity(environment: dict) -> tuple[str, str]:
     for name, record in installations.items():
         if not record or not record.get("dir_info", {}).get("editable"):
             return STATUS_FAIL, f"{name} is not an editable install of the uploaded tree: {record!r}"
-    source_check = environment.get("source_check")
-    if not isinstance(source_check, dict) or not source_check.get("before_install"):
+    source_check = normalize_source_check(environment.get("source_check"))
+    if not isinstance(source_check, dict) or not source_check.get(PHASE_POST_IMAGE_BUILD):
         return STATUS_ERROR, "no inventory comparison of the installed tree"
-    for phase in ("before_install", "after_install"):
+    for phase in INVENTORY_PHASES:
         delta = source_check.get(phase)
         if not isinstance(delta, dict):
             return STATUS_ERROR, f"the {phase} inventory comparison is missing"
@@ -185,6 +201,22 @@ def evaluate_source_integrity(environment: dict) -> tuple[str, str]:
         "both packages resolve inside the uploaded snapshot, neither came from an index, "
         "and the installed tree matches the digested inventory before and after installation"
     )
+
+
+def normalize_source_check(source_check: object) -> object:
+    """Map a schema 1 inventory record onto the current phase names.
+
+    A schema 1 manifest recorded the same two observations under
+    ``before_install``/``after_install``. Reading them under the new names keeps old
+    evidence verifiable instead of making every archived run unreadable.
+    """
+    if not isinstance(source_check, dict):
+        return source_check
+    normalized = dict(source_check)
+    for legacy, current in LEGACY_PHASE_NAMES.items():
+        if legacy in normalized and current not in normalized:
+            normalized[current] = normalized.pop(legacy)
+    return normalized
 
 
 def evaluate_gpu(environment: dict | None) -> tuple[str, str]:
@@ -416,8 +448,73 @@ def download_command(volume_name: str, run_id: str, local_path: str) -> str:
     return f"modal volume get {volume_name} {archive_relpath(run_id)} {local_path}"
 
 
+RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+RUN_ID_MAX_LENGTH = 64
+
+
+def validate_run_id(run_id: object) -> str:
+    """Return *run_id* if it is safe to use as a path component, or raise ``ValueError``.
+
+    A run id becomes a local directory name and a Volume path component, so it is the one
+    string a caller controls that both places trust. It is restricted to ASCII letters,
+    digits, ``-`` and ``_``, must not start with a separator-like character, and is capped
+    so no filesystem or archive target sees an oversized name. Everything that could
+    re-root a path -- ``/``, ``\\``, ``..``, whitespace, shell metacharacters, control
+    characters and non-ASCII homoglyphs -- is simply not in the alphabet.
+    """
+    if not isinstance(run_id, str):
+        raise ValueError(f"run id: expected a string, got {type(run_id).__name__}")
+    if run_id == "":
+        raise ValueError("run id: must not be empty")
+    if len(run_id) > RUN_ID_MAX_LENGTH:
+        raise ValueError(f"run id {run_id!r}: longer than {RUN_ID_MAX_LENGTH} characters")
+    if not RUN_ID_PATTERN.match(run_id):
+        raise ValueError(
+            f"run id {run_id!r}: only ASCII letters, digits, '-' and '_' are allowed, "
+            "and the first character must be a letter or a digit"
+        )
+    return run_id
+
+
 def write_json(path: Path, payload: object) -> None:
     """Write deterministic JSON, creating the parent directory."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def reserve_directory(root: Path, run_id: str) -> Path:
+    """Create ``root/<run_id>`` exclusively, refusing to reuse an existing name.
+
+    A run id names one immutable namespace: its local result directory and its Volume
+    archive path. Creating the directory with ``exist_ok=False`` makes the filesystem
+    arbitrate that claim, so two runs in the same second cannot silently share evidence.
+    An existing directory, file, or symlink is a collision.
+    """
+    validate_run_id(run_id)
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / run_id
+    try:
+        target.mkdir(exist_ok=False)
+    except FileExistsError:
+        raise FileExistsError(f"run id {run_id!r} is already taken under {root}") from None
+    return target
+
+
+def resolve_run_id(root: Path, candidate: str, *, attempts: int = 1000) -> str:
+    """Return *candidate* if it is free under *root*, else suffix it until one is.
+
+    A caller-supplied id is never silently changed: if it is taken, the caller asked for a
+    name that already has evidence, and that is an error. Only a generated id is re-suffixed,
+    because "the same second" is not a request for a specific name.
+    """
+    validate_run_id(candidate)
+    if not (Path(root) / candidate).exists():
+        return candidate
+    base = candidate[: RUN_ID_MAX_LENGTH - 4]
+    for index in range(1, attempts + 1):
+        suffixed = f"{base}-{index:03d}"
+        if not (Path(root) / suffixed).exists():
+            return suffixed
+    raise RuntimeError(f"run id {candidate!r}: no free suffix after {attempts} attempts")

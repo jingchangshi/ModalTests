@@ -43,8 +43,8 @@ PASSING_ENVIRONMENT = {
         },
     },
     "source_check": {
-        "before_install": {"missing": [], "unexpected": [], "modified": []},
-        "after_install": {"missing": [], "unexpected": [], "modified": []},
+        "post_image_build": {"missing": [], "unexpected": [], "modified": []},
+        "post_execution": {"missing": [], "unexpected": [], "modified": []},
     },
 }
 
@@ -141,8 +141,8 @@ def test_complete_evidence_is_pass() -> None:
                 "environment": {
                     **PASSING_ENVIRONMENT,
                     "source_check": {
-                        "before_install": {"missing": ["src/tilefoundry/x.py"], "unexpected": [], "modified": []},
-                        "after_install": {"missing": [], "unexpected": [], "modified": []},
+                        "post_image_build": {"missing": ["src/tilefoundry/x.py"], "unexpected": [], "modified": []},
+                        "post_execution": {"missing": [], "unexpected": [], "modified": []},
                     },
                 }
             },
@@ -153,8 +153,8 @@ def test_complete_evidence_is_pass() -> None:
                 "environment": {
                     **PASSING_ENVIRONMENT,
                     "source_check": {
-                        "before_install": {"missing": [], "unexpected": [], "modified": []},
-                        "after_install": {"missing": [], "unexpected": [], "modified": ["src/tilefoundry/y.py"]},
+                        "post_image_build": {"missing": [], "unexpected": [], "modified": []},
+                        "post_execution": {"missing": [], "unexpected": [], "modified": ["src/tilefoundry/y.py"]},
                     },
                 }
             },
@@ -590,3 +590,41 @@ def test_source_integrity_reason_names_the_evidence() -> None:
     status, reason = demo_report.evaluate_environment(PASSING_ENVIRONMENT, 0)
     assert status == "PASS"
     assert "snapshot" in reason and "inventory" in reason
+
+
+def test_schema_two_names_the_phase_each_observation_sits_on() -> None:
+    """The audit phase names describe what was observed, and the schema moved with them."""
+    assert demo_report.SCHEMA_VERSION == 2
+    assert demo_report.INVENTORY_PHASES == ("post_image_build", "post_execution")
+    assert "before_install" not in demo_report.INVENTORY_PHASES
+    assert "after_install" not in demo_report.INVENTORY_PHASES
+
+
+def test_a_schema_one_manifest_is_still_readable() -> None:
+    """Schema 1 evidence keeps its verdict: the old keys map onto the new meaning.
+
+    Refusing to read a schema 1 archive would make every previously delivered run
+    unverifiable, which is a worse outcome than an honest rename.
+    """
+    legacy = json.loads(json.dumps(PASSING_ENVIRONMENT))
+    legacy["source_check"] = {
+        "before_install": {"missing": [], "unexpected": [], "modified": []},
+        "after_install": {"missing": [], "unexpected": [], "modified": []},
+    }
+    status, reason = demo_report.evaluate_environment(legacy, 0)
+    assert status == demo_report.STATUS_PASS, reason
+
+    resolved = demo_report.normalize_source_check(legacy["source_check"])
+    assert set(resolved) == {"post_image_build", "post_execution"}
+
+
+def test_a_schema_one_manifest_with_drift_still_fails() -> None:
+    """Mapping old keys must not launder a real drift observation into a pass."""
+    legacy = json.loads(json.dumps(PASSING_ENVIRONMENT))
+    legacy["source_check"] = {
+        "before_install": {"missing": [], "unexpected": [], "modified": []},
+        "after_install": {"missing": [], "unexpected": [], "modified": ["src/tilefoundry/y.py"]},
+    }
+    status, reason = demo_report.evaluate_environment(legacy, 0)
+    assert status == demo_report.STATUS_FAIL
+    assert "post_execution" in reason

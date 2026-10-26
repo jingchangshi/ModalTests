@@ -173,10 +173,13 @@ cd /home/shijingchang/workspace/modal/tilefoundry_demo
 python -m pytest tests -q
 ```
 
-84 tests cover the evidence reducer, the inventory/snapshot rules, the plugin's
-build capture, the orchestration path with stubbed stages, and the bundle
-verifier. They assert one property repeatedly: **no missing, partial, skipped,
-or contradictory observation can be reported as `PASS`.**
+The suite covers the evidence reducer, the inventory and snapshot rules, the frozen
+build-input rule, the run-identifier rules, the installed-package provenance rule, the
+plugin's build capture, the orchestration path with stubbed stages, and the bundle
+verifier. It needs no GPU, no Modal client, and no TileFoundry install, so
+`python -m pytest tests -q` prints the current count; this README does not restate a number
+that drifts. They assert one property repeatedly: **no missing, partial, skipped, or
+contradictory observation can be reported as `PASS`.**
 
 ## 10 · Reproducing exactly what a run used
 

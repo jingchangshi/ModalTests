@@ -34,7 +34,8 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 from demo_report import download_command  # noqa: E402
-from demo_report import evaluate, write_json  # noqa: E402
+from demo_report import evaluate, resolve_run_id, reserve_directory, validate_run_id, write_json  # noqa: E402
+from demo_build_inputs import assert_dockerfile_unchanged, frozen_image_inputs  # noqa: E402
 
 DEFAULT_TILEFOUNDRY_REPO = Path(
     os.environ.get("TILEFOUNDRY_REPO", "/home/shijingchang/workspace/TileFoundry")
@@ -65,13 +66,20 @@ if modal.is_local():
 
     STAGING, SNAPSHOT, SNAPSHOT_FILES = prepare(DEFAULT_TILEFOUNDRY_REPO)
     SNAPSHOT["package_version"] = package_version(SNAPSHOT)
+    # The P0-2 proof: the Dockerfile and the build context come from the same frozen
+    # directory as the Python source, so the image cannot be built from one revision while
+    # the manifest names another. `frozen_image_inputs` digests those bytes and refuses a
+    # snapshot that is missing a build input.
+    SNAPSHOT["build_inputs"] = frozen_image_inputs(STAGING, SNAPSHOT)
+    # Re-hash immediately before the path is handed to the builder.
+    assert_dockerfile_unchanged(STAGING, SNAPSHOT["build_inputs"])
     write_json(HERE / "results" / ".snapshot" / "source-snapshot.json", SNAPSHOT)
     IMAGE = (
         modal.Image.from_dockerfile(
-            str(DEFAULT_TILEFOUNDRY_REPO / "Dockerfile"),
-            context_dir=str(DEFAULT_TILEFOUNDRY_REPO),
-            build_args={"CUTLASS_SHA": SNAPSHOT["cutlass_sha"] or ""},
-            ignore=["*"],
+            str(STAGING / "Dockerfile"),
+            context_dir=str(STAGING),
+            build_args={"CUTLASS_SHA": SNAPSHOT["build_inputs"]["cutlass_sha"]},
+            ignore=[],
         )
         .pip_install(
             "setuptools>=68",
@@ -165,11 +173,29 @@ def main(
             "set TILEFOUNDRY_REPO in the environment to point the demo at another checkout"
         )
 
-    run_id = run_id or _timestamp()
+    # A caller-supplied id is taken as given and must be safe and free; a generated id is
+    # re-suffixed until it is free. Either way the namespace is claimed here, before
+    # `preflight.remote` and long before `run_on_h200.remote`, so a rejection costs no GPU.
+    results_root = HERE / "results"
+    generated = not run_id
+    if generated:
+        run_id = resolve_run_id(results_root, _timestamp())
+    else:
+        validate_run_id(run_id)
+    # Claim the namespace now, before any remote work, so a second process cannot take it.
+    # `mkdir(exist_ok=False)` is the authority: it also refuses a planted symlink.
+    try:
+        reserve_directory(results_root, run_id)
+    except FileExistsError:
+        hint = "drop --run-id to let one be generated" if not generated else "wait and retry"
+        raise SystemExit(
+            f"run id {run_id!r} already has evidence under {results_root}; {hint}"
+        ) from None
     payload = {
         "run_id": run_id,
         "snapshot": SNAPSHOT,
         "inventory": SNAPSHOT_FILES,
+        "build_inputs": SNAPSHOT.get("build_inputs"),
         "cpu_only": cpu_only,
     }
     print(
@@ -217,8 +243,12 @@ def main(
 
 
 def _timestamp() -> str:
-    """Return a sortable UTC run identifier with second resolution."""
+    """Return a sortable UTC run identifier with microsecond resolution.
+
+    Microseconds keep two runs launched within the same second from colliding by default;
+    ``resolve_run_id`` still re-suffixes if they somehow do.
+    """
     import datetime
 
-    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
 

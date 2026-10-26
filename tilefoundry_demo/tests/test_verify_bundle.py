@@ -7,6 +7,7 @@ disagree with it. No GPU, torch, or Modal runtime is involved.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import tarfile
@@ -20,6 +21,7 @@ import demo_report  # noqa: E402
 import verify_bundle  # noqa: E402
 
 RUN_ID = "20260101-000000"
+SHARED_LIBRARY = b"\x7fELF\x02\x01\x01\x00fake shared object body\n"
 EVIDENCE = {
     "preflight_returncode": 0,
     "environment": {
@@ -45,8 +47,8 @@ EVIDENCE = {
             },
         },
         "source_check": {
-            "before_install": {"missing": [], "unexpected": [], "modified": []},
-            "after_install": {"missing": [], "unexpected": [], "modified": []},
+            "post_image_build": {"missing": [], "unexpected": [], "modified": []},
+            "post_execution": {"missing": [], "unexpected": [], "modified": []},
         },
     },
     "analysis": {"returncode": 0, "json_ok": True, "executed": ["compute-cost", "memory"], "target": "nvidia.h200_sxm"},
@@ -57,7 +59,14 @@ EVIDENCE = {
         "cu_files": ["module.device_0.cu"],
         "cmake_configured": True,
         "cmake_built": True,
-        "libraries": [{"path": "generated/build/build/libTirSquare.so", "size": 3, "sha256": "aa"}],
+        # The real digest, because check_libraries recomputes it from the archived .so.
+        "libraries": [
+            {
+                "path": "generated/build/build/libTirSquare.so",
+                "size": len(SHARED_LIBRARY),
+                "sha256": hashlib.sha256(SHARED_LIBRARY).hexdigest(),
+            }
+        ],
         "target_arch": "sm_90",
     },
     "execution": {"runtime_calls": 1, "synchronize_calls": 1, "errors": []},
@@ -79,6 +88,21 @@ JUNIT = (
 )
 
 
+def record_members(bundle: Path) -> list[dict]:
+    """List the bundle's members the way the container's ``_file_inventory`` does."""
+    return [
+        {
+            "path": f"{bundle.name}/{path.relative_to(bundle).as_posix()}",
+            "size": path.stat().st_size,
+            "sha256": verify_bundle.sha256_file(path),
+        }
+        for path in sorted(bundle.rglob("*"))
+        if path.is_file() and not path.is_symlink()
+        # A file cannot record its own digest; the verifier hashes the manifest itself.
+        and path.name != "manifest.json"
+    ]
+
+
 def build_bundle(root: Path, evidence: dict | None = None) -> Path:
     """Materialise one evidence directory with every member the verifier requires."""
     evidence = evidence or EVIDENCE
@@ -91,7 +115,7 @@ def build_bundle(root: Path, evidence: dict | None = None) -> Path:
     (bundle / "results/junit.xml").write_text(JUNIT)
     (bundle / "results/test-results.json").write_text(json.dumps({"compile": evidence["compile"], "execution": evidence["execution"], "correctness": evidence["correctness"]}))
     (bundle / "logs/compile-and-test.log").write_text("1 passed\n")
-    (bundle / "generated/build/build/libTirSquare.so").write_bytes(b"\x7fELF")
+    (bundle / "generated/build/build/libTirSquare.so").write_bytes(SHARED_LIBRARY)
     (bundle / "generated/test/build/module.device_0.cu").write_text("__global__ void k() {}\n")
     verdict = demo_report.evaluate(evidence)
     manifest = {
@@ -110,6 +134,7 @@ def build_bundle(root: Path, evidence: dict | None = None) -> Path:
         "stage_details": verdict["stages"],
         "evidence": evidence,
     }
+    manifest["files"] = record_members(bundle)
     (bundle / "manifest.json").write_text(json.dumps(manifest))
     archive = root / f"{bundle.name}.tar.gz"
     with tarfile.open(archive, "w:gz") as tar:
@@ -220,3 +245,122 @@ def test_an_archive_that_overstates_its_own_verdict_is_rejected(tmp_path: Path) 
     result["artifacts_bundle"]["archive_bytes"] = rebuilt.stat().st_size
     failures = verify_bundle.verify(rebuilt, result, tmp_path / "work4")
     assert any("overall_status" in failure for failure in failures)
+
+
+def _extract_all(archive: Path, workdir: Path) -> Path:
+    """Extract *archive* under *workdir* and return its bundle directory."""
+    return verify_bundle.extract(archive, workdir)
+
+
+def _rearchive(bundle: Path) -> Path:
+    """Repack *bundle* in place, replacing the archive the fixture wrote."""
+    archive = bundle.parent / f"{bundle.name}.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(bundle, arcname=bundle.name)
+    return archive
+
+
+def test_a_member_missing_from_the_archive_is_rejected(tmp_path: Path) -> None:
+    """A dropped log makes the archive unverifiable even when every other field matches."""
+    archive = build_bundle(tmp_path)
+    result = printed_result(archive)
+    bundle = _extract_all(archive, tmp_path / "work")
+    (bundle / "logs/compile-and-test.log").unlink()
+    archive = _rearchive(bundle)
+
+    result["artifacts_bundle"]["archive_sha256"] = verify_bundle.sha256_file(archive)
+    result["artifacts_bundle"]["archive_bytes"] = archive.stat().st_size
+    failures = verify_bundle.verify(archive, result, tmp_path / "work2")
+    assert any("missing archive member" in item for item in failures)
+    assert any("listed member is missing" in item for item in failures)
+
+
+def test_a_member_added_to_the_archive_is_rejected(tmp_path: Path) -> None:
+    """An unlisted extra file was not present when the run finished."""
+    archive = build_bundle(tmp_path)
+    result = printed_result(archive)
+    bundle = _extract_all(archive, tmp_path / "work")
+    (bundle / "results/extra.json").write_text("{}")
+    archive = _rearchive(bundle)
+
+    result["artifacts_bundle"]["archive_sha256"] = verify_bundle.sha256_file(archive)
+    result["artifacts_bundle"]["archive_bytes"] = archive.stat().st_size
+    failures = verify_bundle.verify(archive, result, tmp_path / "work2")
+    assert any("does not list" in item and "extra.json" in item for item in failures)
+
+
+def test_a_member_rewritten_after_the_manifest_is_rejected(tmp_path: Path) -> None:
+    """Same names and sizes, different bytes: only the per-member digest catches this."""
+    archive = build_bundle(tmp_path)
+    result = printed_result(archive)
+    bundle = _extract_all(archive, tmp_path / "work")
+    log = bundle / "logs/compile-and-test.log"
+    original = log.read_text()
+    log.write_text(original.replace("1 passed", "1 failed"))
+    archive = _rearchive(bundle)
+
+    result["artifacts_bundle"]["archive_sha256"] = verify_bundle.sha256_file(archive)
+    result["artifacts_bundle"]["archive_bytes"] = archive.stat().st_size
+    failures = verify_bundle.verify(archive, result, tmp_path / "work2")
+    assert any("compile-and-test.log" in item and "recorded sha256" in item for item in failures)
+
+
+def test_a_shared_library_without_a_compile_record_is_rejected(tmp_path: Path) -> None:
+    """A .so nobody's compile call produced is unattributed code."""
+    archive = build_bundle(tmp_path)
+    result = printed_result(archive)
+    bundle = _extract_all(archive, tmp_path / "work")
+    (bundle / "generated/build/build/libStray.so").write_bytes(b"\x7fELFstray")
+    archive = _rearchive(bundle)
+
+    result["artifacts_bundle"]["archive_sha256"] = verify_bundle.sha256_file(archive)
+    result["artifacts_bundle"]["archive_bytes"] = archive.stat().st_size
+    failures = verify_bundle.verify(archive, result, tmp_path / "work2")
+    assert any("which no compile record names" in item for item in failures)
+
+
+def test_a_shared_library_whose_digest_drifted_is_rejected(tmp_path: Path) -> None:
+    """The archived .so must be the bytes the compiler reported."""
+    archive = build_bundle(tmp_path)
+    result = printed_result(archive)
+    bundle = _extract_all(archive, tmp_path / "work")
+    library = bundle / "generated/build/build/libTirSquare.so"
+    library.write_bytes(library.read_bytes() + b"\x00")
+    archive = _rearchive(bundle)
+
+    result["artifacts_bundle"]["archive_sha256"] = verify_bundle.sha256_file(archive)
+    result["artifacts_bundle"]["archive_bytes"] = archive.stat().st_size
+    failures = verify_bundle.verify(archive, result, tmp_path / "work2")
+    assert any("differs from the compile record" in item for item in failures)
+
+
+def test_an_empty_file_list_is_rejected(tmp_path: Path) -> None:
+    """A bundle that lists nothing cannot be audited, so it does not verify."""
+    archive = build_bundle(tmp_path)
+    result = printed_result(archive)
+    bundle = _extract_all(archive, tmp_path / "work")
+    manifest = json.loads((bundle / "manifest.json").read_text())
+    manifest["files"] = []
+    (bundle / "manifest.json").write_text(json.dumps(manifest))
+    archive = _rearchive(bundle)
+
+    result["artifacts_bundle"]["archive_sha256"] = verify_bundle.sha256_file(archive)
+    result["artifacts_bundle"]["archive_bytes"] = archive.stat().st_size
+    failures = verify_bundle.verify(archive, result, tmp_path / "work2")
+    assert any("cannot be audited" in item for item in failures)
+
+
+def test_a_duplicate_file_entry_is_rejected(tmp_path: Path) -> None:
+    """Two entries for one path leave the real digest ambiguous."""
+    archive = build_bundle(tmp_path)
+    result = printed_result(archive)
+    bundle = _extract_all(archive, tmp_path / "work")
+    manifest = json.loads((bundle / "manifest.json").read_text())
+    manifest["files"].append(dict(manifest["files"][0]))
+    (bundle / "manifest.json").write_text(json.dumps(manifest))
+    archive = _rearchive(bundle)
+
+    result["artifacts_bundle"]["archive_sha256"] = verify_bundle.sha256_file(archive)
+    result["artifacts_bundle"]["archive_bytes"] = archive.stat().st_size
+    failures = verify_bundle.verify(archive, result, tmp_path / "work2")
+    assert any("twice" in item for item in failures)

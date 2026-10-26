@@ -21,7 +21,10 @@ import tarfile
 import time
 from pathlib import Path
 
+from demo_provenance import check_provenance
 from demo_report import (
+    PHASE_POST_EXECUTION,
+    PHASE_POST_IMAGE_BUILD,
     combine_with_archive,
     evaluate,
     inventory,
@@ -155,6 +158,10 @@ def collect_environment(source_root: Path, log: Path) -> dict:
     environment["origin_inside_snapshot"] = all(
         origin is not None and origin.startswith(str(source_root) + os.sep) for origin in origins
     )
+    # The full P0-4 rule: exact install URL, import path inside it, one shared version, and
+    # an installed tree that still matches the digested inventory. `origin_inside_snapshot`
+    # above only says "somewhere under the snapshot"; this names every discrepancy.
+    environment["provenance_failures"] = check_provenance(environment, str(source_root))
 
     try:
         from tilefoundry_nvidia import CudaTarget
@@ -379,9 +386,47 @@ def run_test(source_root: Path, results_dir: Path, logs_dir: Path, dump_root: Pa
     }
 
 
+def _file_inventory(root: Path, run_id: str) -> list[dict]:
+    """List every regular file the archive carries, with its size and digest.
+
+    The archive's own digest cannot appear inside the archive, so the bundle names its
+    members one by one instead. A downloaded copy can then be checked file by file: a member
+    silently dropped, added, or rewritten in transit shows up as a mismatch against this
+    list, not merely as a different tarball digest.
+    """
+    members = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or path.is_symlink():
+            continue
+        relative = path.relative_to(root).as_posix()
+        # A file cannot record its own digest, and the manifest carries this list. The
+        # verifier hashes manifest.json against the archive instead.
+        if relative == "manifest.json":
+            continue
+        members.append(
+            {
+                "path": f"tilefoundry-demo-{run_id}/{relative}",
+                "size": path.stat().st_size,
+                "sha256": sha256_file(path),
+            }
+        )
+    return members
+
+
 def _bundle(root: Path, run_id: str, volume_root: Path) -> dict:
     """Archive the evidence directory as one tarball and publish it to the Volume."""
     archive = Path("/tmp") / f"tilefoundry-demo-{run_id}.tar.gz"
+    # Digest the members before writing the archive, so the list describes the bytes that
+    # went in. A file changed mid-write would then also be caught by verify_bundle.py.
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    files = _file_inventory(root, run_id)
+    manifest["files"] = files
+    manifest["files_note"] = (
+        "every archived member except manifest.json itself, which cannot record its own "
+        "digest; verify_bundle.py hashes it against the archive"
+    )
+    write_json(manifest_path, manifest)
     with tarfile.open(archive, "w:gz") as tar:
         tar.add(root, arcname=f"tilefoundry-demo-{run_id}")
     destination = volume_root / "runs" / run_id
@@ -394,6 +439,8 @@ def _bundle(root: Path, run_id: str, volume_root: Path) -> dict:
         "archive_path": remote.relative_to(volume_root).as_posix(),
         "archive_bytes": remote.stat().st_size,
         "archive_sha256": sha256_file(remote),
+        "files": files,
+        "file_count": len(files),
     }
 
 
@@ -426,9 +473,13 @@ def preflight(source_root: Path, payload: dict) -> dict:
     logs_dir.mkdir(parents=True, exist_ok=True)
     expected = payload.get("inventory") or []
     environment = collect_environment(source_root, logs_dir / "environment.log")
+    # One observation only: this process starts after the image has already installed the
+    # snapshot, so there is no pre-install state to observe here. The second observation is
+    # taken by run(), after the kernel has been built and executed.
+    post_image_build = inventory_delta(expected, inventory(source_root)) if expected else None
     environment["source_check"] = {
-        "before_install": inventory_delta(expected, inventory(source_root)) if expected else None,
-        "after_install": inventory_delta(expected, inventory(source_root)) if expected else None,
+        PHASE_POST_IMAGE_BUILD: post_image_build,
+        PHASE_POST_EXECUTION: None,
     }
     environment["preflight_returncode"] = 0 if environment.get("imports_ok") else 1
     statuses = evaluate(
@@ -481,7 +532,7 @@ def _run(payload: dict, source_root: Path) -> dict:
     exception_text: str | None = None
 
     try:
-        source_check["before_install"] = inventory_delta(expected_inventory, inventory(source_root))
+        source_check[PHASE_POST_IMAGE_BUILD] = inventory_delta(expected_inventory, inventory(source_root))
         environment = collect_environment(source_root, logs_dir / "environment.log")
         evidence["environment"] = environment
         evidence["preflight_returncode"] = 0 if environment.get("imports_ok") else 1
@@ -496,7 +547,7 @@ def _run(payload: dict, source_root: Path) -> dict:
                     "correctness": observed["correctness"],
                 }
             )
-        source_check["after_install"] = inventory_delta(expected_inventory, inventory(source_root))
+        source_check[PHASE_POST_EXECUTION] = inventory_delta(expected_inventory, inventory(source_root))
     except BaseException as error:  # noqa: BLE001 - a crash is evidence, not a silent abort
         exception_text = f"{type(error).__name__}: {error}\n\n{_tail(logs_dir / 'compile-and-test.log')}"
         (logs_dir / "exception.txt").write_text(exception_text + "\n", encoding="utf-8")

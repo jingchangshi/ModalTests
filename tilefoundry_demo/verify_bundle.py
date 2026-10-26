@@ -62,6 +62,90 @@ def extract(archive: Path, destination: Path) -> Path:
     return destination / roots.pop()
 
 
+#: The members a bundle must carry for the evidence to be checkable at all.
+REQUIRED_MEMBERS = (
+    "manifest.json",
+    "results/analysis.json",
+    "results/junit.xml",
+    "results/test-results.json",
+    "logs/compile-and-test.log",
+)
+
+
+def check_file_list(bundle: Path, manifest: dict) -> list[str]:
+    """Re-hash every archived member against the list the bundle recorded.
+
+    The bundle cannot contain its own digest, so it lists its members instead. This is the
+    check that makes that list worth having: it catches a member dropped in transit, a
+    member added afterwards, and a member rewritten with its tar header left alone, which a
+    whole-archive digest alone would also catch but could not localise.
+    """
+    failures: list[str] = []
+    recorded = manifest.get("files")
+    if not isinstance(recorded, list) or not recorded:
+        return ["the archived manifest lists no files, so its members cannot be audited"]
+
+    expected: dict[str, dict] = {}
+    for entry in recorded:
+        path = entry.get("path") if isinstance(entry, dict) else None
+        if not isinstance(path, str) or not path:
+            failures.append(f"the archived manifest has a file entry with no path: {entry!r}")
+            continue
+        if path in expected:
+            failures.append(f"the archived manifest lists {path!r} twice")
+        expected[path] = entry
+
+    top = bundle.name
+    actual = {
+        f"{top}/{path.relative_to(bundle).as_posix()}": path
+        for path in bundle.rglob("*")
+        if path.is_file() and not path.is_symlink()
+        # A file cannot record its own digest, so the manifest is exempt from its own list.
+        # It is still checked below against the printed overall_status and evidence.
+        and not (path.parent == bundle and path.name == "manifest.json")
+    }
+
+    for path in sorted(set(expected) - set(actual)):
+        failures.append(f"a listed member is missing from the archive: {path}")
+    for path in sorted(set(actual) - set(expected)):
+        failures.append(f"the archive holds a member the manifest does not list: {path}")
+
+    for path in sorted(set(expected) & set(actual)):
+        entry = expected[path]
+        file = actual[path]
+        if entry.get("size") != file.stat().st_size:
+            failures.append(
+                f"{path}: recorded size {entry.get('size')}, archived size {file.stat().st_size}"
+            )
+        digest = sha256_file(file)
+        if entry.get("sha256") != digest:
+            failures.append(f"{path}: recorded sha256 {entry.get('sha256')}, archived {digest}")
+    return failures
+
+
+def check_libraries(bundle: Path, observed: dict) -> list[str]:
+    """Bind each archived shared library to the digest the compiler reported."""
+    failures: list[str] = []
+    libraries = (observed.get("compile") or {}).get("libraries") or []
+    if not libraries:
+        return ["the archived evidence records no compiled library, so the .so is unattributed"]
+    by_name = {}
+    for record in libraries:
+        if isinstance(record, dict) and isinstance(record.get("path"), str):
+            by_name[Path(record["path"]).name] = record
+    built = sorted(bundle.rglob("*.so"))
+    if not built:
+        return ["the archive holds no built shared library"]
+    for library in built:
+        record = by_name.get(library.name)
+        if record is None:
+            failures.append(f"the archive holds {library.name}, which no compile record names")
+            continue
+        if record.get("sha256") != sha256_file(library):
+            failures.append(f"{library.name}: the archive digest differs from the compile record")
+    return failures
+
+
 def verify(archive: Path, result: dict, workdir: Path) -> list[str]:
     """Return every discrepancy between the archive and the printed result."""
     failures: list[str] = []
@@ -69,9 +153,13 @@ def verify(archive: Path, result: dict, workdir: Path) -> list[str]:
     manifest = json.loads((bundle / "manifest.json").read_text())
     evidence = manifest.get("evidence") or {}
 
-    for name in ("manifest.json", "results/analysis.json", "results/junit.xml", "results/test-results.json", "logs/compile-and-test.log"):
+    for name in REQUIRED_MEMBERS:
         if not (bundle / name).exists():
             failures.append(f"missing archive member: {name}")
+
+    # P0-5 closure: the archive's own digest cannot live inside it, so every member is
+    # re-hashed against the list the bundle carries.
+    failures += check_file_list(bundle, manifest)
 
     for field in MATCHED_FIELDS:
         archived = manifest.get(field)
@@ -124,9 +212,7 @@ def verify(archive: Path, result: dict, workdir: Path) -> list[str]:
     if not comparisons or comparisons[0].get("rtol") != 0 or comparisons[0].get("atol") != 0:
         failures.append("the archived comparison was not tolerance-free")
 
-    library = bundle / "generated/build/build"
-    if not any(path.suffix == ".so" for path in library.glob("*.so")):
-        failures.append("the archive holds no built shared library")
+    failures += check_libraries(bundle, observed)
     if not any(bundle.glob("generated/**/*.cu")):
         failures.append("the archive holds no generated CUDA source")
 

@@ -214,7 +214,7 @@ def test_run_reports_missing_stages_without_claiming_success(tmp_path: Path, mon
     # The GPU path must attach the inventory comparison itself; the environment
     # observer does not produce it, so a passing source-integrity gate here
     # proves the attachment, not the stub.
-    assert manifest["evidence"]["environment"]["source_check"]["before_install"] == {
+    assert manifest["evidence"]["environment"]["source_check"]["post_image_build"] == {
         "missing": [],
         "unexpected": [],
         "modified": [],
