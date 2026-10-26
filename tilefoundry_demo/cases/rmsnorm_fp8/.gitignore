@@ -1,0 +1,8 @@
+# Generated reference artefacts and analysis output: reproducible from the
+# committed sources by `python make_reference.py` and `tilefoundry analyze`.
+x.pt
+expected.pt
+model.safetensors
+Naive.txt
+Fused.txt
+__pycache__/

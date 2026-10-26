@@ -1,0 +1,15 @@
+{
+  "block": 128,
+  "blocks": 56,
+  "eps": 1e-06,
+  "fmt": "e4m3",
+  "fp8_max": 448.0,
+  "h": 7168,
+  "normed_dtype": "torch.bfloat16",
+  "quant_dtype": "torch.float8_e4m3fn",
+  "reference_class": "transformers.models.llama.modeling_llama.LlamaRMSNorm",
+  "rows": 2,
+  "scale_dtype": "torch.float32",
+  "seed": 0,
+  "torch_version": "2.14.1+cpu"
+}

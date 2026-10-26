@@ -1,0 +1,100 @@
+{
+  "tilefoundry": {
+    "repo": "/home/shijingchang/workspace/TileFoundry",
+    "commit": "1393b1945629adf2a3a8ec5747499d7a63d35f5a",
+    "describe": "1393b19",
+    "committed_at": "2026-10-25T17:56:04+08:00",
+    "branch_at_freeze": "main",
+    "worktree_clean": true
+  },
+  "why_this_sha": "The goal allows the published online docs to differ from the local checkout. Reproduction is pinned to the local checkout at this SHA, because that is the source that actually runs in the Modal image.",
+  "tutorial_sources": [
+    {
+      "path": "docs/tutorial/index.md",
+      "sha256": "0231be9523cefbd92daa0dc38a7cb7bc87e7535f7472cd6389e886d4fb13269a"
+    },
+    {
+      "path": "docs/tutorial/migrate.md",
+      "sha256": "6f724b7b8671fd14c10ea6b0c54ab6f1cef1895cef22052527bf5e8e63a65dc4"
+    },
+    {
+      "path": "docs/tutorial/optimize.md",
+      "sha256": "148abf23ad8a3ed1fd347890419faa4a45c2f46905fc483d2195b28103a34f6f"
+    },
+    {
+      "path": "docs/tutorial/migrate.ipynb",
+      "sha256": "666716048dc6a818177dc272cf420dcae4661e156a5279541d69d23690fbaa3e"
+    },
+    {
+      "path": "docs/tutorial/optimize.ipynb",
+      "sha256": "4071915cba4c5869116f8658ffbded5b2c60e8885893323fba914431c846e21e"
+    },
+    {
+      "path": "src/tilefoundry/cli/check.py",
+      "sha256": "45a22d9c542c15398fdb331e91dafdd5d29d12db45d707a52a437f49a2e70685"
+    },
+    {
+      "path": "src/tilefoundry/cli/analyze.py",
+      "sha256": "e107ffca44e3842b83867ab090f8dd904d2c4874ffa84c71c1be68969edc5a55"
+    },
+    {
+      "path": "src/tilefoundry/cli/tutorial.py",
+      "sha256": "f37b8e844b2fd401bae4b75587e493cbb55b952378e499211d0c2d35d777aef7"
+    }
+  ],
+  "cli_api_at_freeze": {
+    "check_positional": "SOURCE = FILE.py:Selector",
+    "check_inputs": ["random", "files:A.pt,B.pt"],
+    "check_weights": ["random", "ckpt:DIR"],
+    "check_predicates": ["allclose", "cosine", "equal", "max_abs", "max_rel", "nan_inf", "rel_l2", "ulp"],
+    "check_predicate_bounds": {
+      "allclose": ["atol", "rtol"],
+      "cosine": ["min"],
+      "max_abs": ["max"],
+      "max_rel": ["max"],
+      "equal": [],
+      "nan_inf": [],
+      "rel_l2": ["max"],
+      "ulp": ["max"]
+    },
+    "check_exit_codes": {
+      "0": "every stated predicate passed",
+      "1": "at least one stated predicate failed",
+      "2": "argument/usage error"
+    },
+    "check_json_flag": "--json PATH writes {target, runs, passed}",
+    "analyze_positional": "SOURCE REPORT",
+    "analyze_flags": ["--compute-cost", "--memory", "--roofline"],
+    "out_fn_ordering": "argparse.Ordered action preserves the interleaved --out/--fn/bounds sequence",
+    "tutorial_subcommands": ["migrate", "optimize"]
+  },
+  "case_constants_from_local_source": {
+    "migrate": {
+      "file": "docs/tutorial/migrate.md",
+      "rows": 2,
+      "h": 7168,
+      "block": 128,
+      "blocks": 56,
+      "fp8_max": 448.0,
+      "eps": 1e-06,
+      "note": "H is this example's row width, not a model field. eps/block/fmt come from config.json."
+    },
+    "optimize": {
+      "file": "docs/tutorial/optimize.md",
+      "pair": 2,
+      "ctas": 132,
+      "rows": 264,
+      "h": 7168,
+      "block": 128,
+      "blocks": 56,
+      "fp8_max": 448.0,
+      "eps": 1e-06,
+      "note": "ROWS = PAIR * CTAS = 264; CTAS equals the H200 SM count so the grid is one wave."
+    }
+  },
+  "goal_doc_hint_check": {
+    "claim": "The goal document predicted ROWS=2,H=7168,BLOCK=128,FP8_MAX=448.0,EPS=1e-6 for migrate and ROWS=264,CTAS=132,PAIR=2,BLOCK=128 for optimize.",
+    "verdict": "CONFIRMED against the local sources at this SHA. The hint was not trusted; the values above were read from the files.",
+    "correction": "ROWS=264 is not a literal in optimize.md; it is computed as PAIR * CTAS."
+  }
+}

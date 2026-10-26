@@ -120,6 +120,9 @@ if modal.is_local():
             "demo_report",
             "demo_source",
             "demo_task",
+            # Imported by the experiment driver, which reuses this frozen image and so
+            # must be able to import this module in the container too.
+            "run_demo",
         )
     )
 else:

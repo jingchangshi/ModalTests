@@ -1,0 +1,101 @@
+{
+  "schema": "tilefoundry-p2-5-agent-exploration/v1",
+  "question": "Can an agent design a third placement of the RMSNorm+FP8 step, guided only by the compiler's own reports, that the compiler accepts and that improves on the tutorial's two placements?",
+  "inputs_available_to_the_agent": {
+    "tutorial_placements": ["Naive", "Fused"],
+    "compiler_reports": {
+      "Naive": {"ideal_ns": 8697, "bound_by": "memory", "source": "tilefoundry analyze rms_norm_quant_opt.py:Naive --compute-cost --memory --roofline"},
+      "Fused": {"ideal_ns": 3755, "bound_by": "memory", "source": "tilefoundry analyze rms_norm_quant_opt.py:Fused --compute-cost --memory --roofline"}
+    },
+    "not_available_to_the_agent": [
+      "the tutorial's optimize.md prose explaining why Fused is faster",
+      "the benchmark results"
+    ]
+  },
+  "reasoning_chain": [
+    {
+      "step": 1,
+      "observation": "Both placements report bound-by=memory, so arithmetic is not the lever.",
+      "source": "compiler report: '# roofline ideal-ns=8697 bound-by=memory' and 'ideal-ns=3755 bound-by=memory'"
+    },
+    {
+      "step": 2,
+      "observation": "The only structural difference between the two is the @func boundary. Naive writes the normalized rows to gmem and reads them back; the traffic delta is 3784704 B each way.",
+      "source": "compiler reports: Naive gmem r7.23MiB/w5.47MiB@logical vs Fused r3.62MiB/w1.86MiB@logical"
+    },
+    {
+      "step": 3,
+      "observation": "Fused already removed the boundary traffic, so a candidate cannot beat Fused by removing more of the same traffic.",
+      "source": "the Fused gmem figures show no intermediate row traffic remains"
+    },
+    {
+      "step": 4,
+      "hypothesis": "What Fused still pays is on-chip residency: the activations are held in rmem for the whole func (rmem r70.57MiB/w56.07MiB@logical). Moving them to smem changes the on-chip level without changing gmem traffic or arithmetic.",
+      "candidate": "SplitMeta: Fused's single func and arithmetic, with `a` and `gamma` resharded to smem"
+    }
+  ],
+  "compiler_feedback_encountered": [
+    {
+      "attempt": 1,
+      "compiler_message": "Binary: input 0 is laid out more coarsely and kept in rmem, which does not reach the units this runs on; reshard it to smem or gmem first",
+      "meaning": "A 4-D layout with the CTA axis first is more coarse than the units the multiply runs on.",
+      "agent_response": "Followed Fused's 3-D sharding exactly instead of inventing a 4-D one."
+    },
+    {
+      "attempt": 2,
+      "compiler_message": "Binary: operands have conflicting storage (rmem, smem); a multi-input op requires its concrete operands to share one residency",
+      "meaning": "Moving only `a` to smem is illegal while `gamma` stays in rmem.",
+      "agent_response": "Moved both operands to smem."
+    },
+    {
+      "attempt": 3,
+      "compiler_message": "Reshape cannot express the sharded layout: new shape does not align with the input layout factorization",
+      "meaning": "A smem-resident sharded value cannot be reshaped to (ROWS, BLOCKS, BLOCK) when the CTA axis carries no genuine split (1 CTA for a 2-row checked shape).",
+      "agent_response": "Separated the analysis variant (264 rows, real split) from a checked variant at the 2-row shape the checking inputs carry."
+    },
+    {
+      "attempt": 4,
+      "compiler_message": "default_shard_layout: logical axis 0 size 2 is not divisible by mesh extent product 4 (role 'layout')",
+      "meaning": "The 264-row thread mesh subdivides rows by PAIR*4=8, which does not divide 2.",
+      "agent_response": "Followed the tutorial's checked modules and used one CTA with no explicit resharding for the checked variant."
+    },
+    {
+      "attempt": 5,
+      "compiler_message": "evaluator: shape '[264, 56, 128]' is invalid for input of size 14336",
+      "meaning": "The checked module declared 264 rows while x.pt carries 2.",
+      "agent_response": "Declared the checked row count."
+    }
+  ],
+  "outcome": {
+    "correctness": {
+      "verdict": "PASS",
+      "command": [
+        "tilefoundry", "check", "agent_candidate.py:SplitMetaChecked",
+        "--inputs", "files:x.pt", "--weights", "ckpt:.", "--expected", "expected.pt",
+        "--device", "cuda",
+        "--out", "output[0]", "--fn", "equal",
+        "--out", "output[1]", "--fn", "allclose", "--atol", "1e-6", "--rtol", "1e-6"
+      ],
+      "result": "output[0] equal: mismatched 0 elements of 14336 PASS; output[1] allclose(atol=1e-06 rtol=1e-06): max_violation 0 PASS",
+      "exit_status": 0
+    },
+    "compiler_cost": {
+      "command": ["tilefoundry", "analyze", "agent_candidate.py:SplitMeta", "--compute-cost", "--memory", "--roofline"],
+      "ideal_ns": 3755,
+      "bound_by": "memory",
+      "gmem": "r3.62MiB/w1.86MiB@logical (identical to Fused)",
+      "on_chip": "rmem r16B/w0, smem r70.57MiB/w56.07MiB@logical",
+      "comparison_to_fused": "same gmem traffic and same ideal-ns; the activations moved from rmem to smem with the byte count unchanged"
+    },
+    "verdict": "The candidate is correct and the compiler accepts it, but it does NOT improve the modelled time. The hypothesis is refuted on the metric it was aiming at: moving residency from rmem to smem leaves ideal-ns at 3755, because both are on-chip and neither is the bottleneck. The step is bound by gmem, and the candidate does not move gmem traffic.",
+    "honest_negative": true,
+    "why_this_is_recorded": "The instruction for P2-5 was to show an agent candidate being checked by the compiler, not to produce a speedup. Reporting a candidate that passes correctness but fails its own performance hypothesis is the evidence; claiming an optimization here would be fabrication."
+  },
+  "ground_truth": {
+    "expected_pt_rows": 2,
+    "expected_pt_h": 7168,
+    "expected_pt_blocks": 56,
+    "analysis_shape_rows": 264,
+    "note": "The analysis placements describe 264 rows while the checking inputs carry 2. The tutorial has the same split, and the two shapes are kept in separate module variants for that reason."
+  }
+}

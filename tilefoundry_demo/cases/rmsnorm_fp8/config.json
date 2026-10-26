@@ -1,0 +1,10 @@
+{
+  "rms_norm_eps": 1e-06,
+  "quantization_config": {
+    "weight_block_size": [
+      128,
+      128
+    ],
+    "fmt": "e4m3"
+  }
+}
