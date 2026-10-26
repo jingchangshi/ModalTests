@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RMSNorm + FP8：Agent 与 TileFoundry 编译器协同实验</title>
+<style>
+:root {
+  --bg: #10141b; --panel: #171d26; --panel-2: #1e2531; --line: #2b3543;
+  --ink: #e6ecf5; --ink-dim: #9aa8bd; --agent: #4da3ff; --compiler: #f0a03c;
+  --pass: #3ecf8e; --fail: #ff6b6b; --neutral: #8b98ad;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 15px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+}
+.wrap { max-width: 1600px; margin: 0 auto; padding: 32px 28px 96px; }
+h1 { font-size: 26px; margin: 0 0 6px; letter-spacing: .2px; }
+h2 { font-size: 19px; margin: 44px 0 14px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
+h3 { font-size: 15px; margin: 22px 0 8px; color: var(--ink-dim); font-weight: 600; }
+.sub { color: var(--ink-dim); margin: 0 0 24px; font-size: 14px; }
+.meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+        gap: 10px; margin: 20px 0 8px; }
+.meta div { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+.meta dt { color: var(--ink-dim); font-size: 12px; margin: 0 0 3px; }
+.meta dd { margin: 0; font: 13px/1.4 var(--mono); word-break: break-all; }
+table { width: 100%; border-collapse: collapse; margin: 12px 0 8px; font-size: 14px; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--ink-dim); font-weight: 600; font-size: 13px; }
+td.num, th.num { text-align: right; font-family: var(--mono); }
+code, .mono { font-family: var(--mono); font-size: 13px; }
+pre { background: #0c1016; border: 1px solid var(--line); border-radius: 8px;
+      padding: 12px 14px; overflow-x: auto; font-family: var(--mono);
+      font-size: 12.5px; line-height: 1.55; margin: 10px 0; }
+.tag { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px;
+       font-weight: 600; letter-spacing: .3px; vertical-align: 1px; }
+.tag-replay { background: #2a3a52; color: #9dc4f0; }
+.tag-accepted { background: #24402f; color: #7fe0ac; }
+.tag-rejected { background: #4a2b2b; color: #ff9d9d; }
+.tag-agent { background: #2c4436; color: #7fe0ac; }
+.timeline { display: grid; grid-template-columns: 78px 1fr 1fr; gap: 0; }
+.timeline > .head { color: var(--ink-dim); font-size: 12px; font-weight: 600;
+                    padding: 0 0 10px; border-bottom: 1px solid var(--line); }
+.row { display: contents; }
+.cell { padding: 10px 0; }
+.event { margin: 0 0 8px; border: 1px solid var(--line); border-radius: 8px;
+         background: var(--panel); overflow: hidden; }
+.event > summary { cursor: pointer; padding: 10px 12px; list-style: none; }
+.event > summary::-webkit-details-marker { display: none; }
+.event[open] > summary { border-bottom: 1px solid var(--line); background: var(--panel-2); }
+.event .id { font: 11px var(--mono); color: var(--ink-dim); margin-right: 6px; }
+.event .act { font-weight: 600; }
+.event .sum { color: var(--ink-dim); font-size: 13px; margin: 3px 0 0; }
+.body { padding: 12px; }
+.body dl { display: grid; grid-template-columns: 130px 1fr; gap: 4px 12px; margin: 0 0 8px; font-size: 13px; }
+.body dt { color: var(--ink-dim); }
+.body dd { margin: 0; }
+.agent .event { border-left: 3px solid var(--agent); }
+.compiler .event { border-left: 3px solid var(--compiler); }
+.side-agent { color: var(--agent); }
+.side-compiler { color: var(--compiler); }
+.pass { color: var(--pass); font-weight: 600; }
+.fail { color: var(--fail); font-weight: 600; }
+.dim { color: var(--ink-dim); }
+.bar { height: 22px; border-radius: 4px; display: inline-block; vertical-align: middle; }
+.barrow { display: grid; grid-template-columns: 150px 1fr 96px; gap: 10px;
+          align-items: center; margin: 7px 0; font-size: 13px; }
+.note { border-left: 3px solid var(--compiler); background: var(--panel);
+        padding: 10px 14px; border-radius: 0 8px 8px 0; margin: 14px 0; font-size: 14px; }
+.split { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+@media (max-width: 1100px) { .split, .timeline { grid-template-columns: 1fr; } .row { display: block; } }
+.flow { margin: 16px 0; font: 13px/2 var(--mono); color: var(--ink-dim); white-space: pre; overflow-x: auto; }
+footer { margin-top: 56px; padding-top: 16px; border-top: 1px solid var(--line);
+         color: var(--ink-dim); font-size: 12.5px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>RMSNorm + FP8：Agent 与 TileFoundry 编译器的协同实验</h1>
+<p class="sub">按时间顺序展示真实的协作事件。左列是 Agent 的动作，右列是编译器与运行时的反馈。
+点击任意事件查看命令、源码差异、编译器输出与结果。</p>
+
+<div class="meta">
+  <div><dt>run_id</dt><dd>20261026-093917-359073</dd></div>
+  <div><dt>task_id</dt><dd>rmsnorm-fp8-tutorial</dd></div>
+  <div><dt>GPU</dt><dd>NVIDIA H200 / CC [9, 0]</dd></div>
+  <div><dt>python</dt><dd>3.12.15</dd></div>
+  <div><dt>torch</dt><dd>2.9.1+cu128</dd></div>
+  <div><dt>triton</dt><dd>3.5.1</dd></div>
+  <div><dt>实验记录</dt><dd>results/experiments-20261026-110746-743687/experiments.json</dd></div>
+</div>
+
+<div class="note">
+<b>静态预测与真实测量是两回事。</b>下方的 <code>ideal-ns</code> 是编译器把字节数除以带宽得到的
+模型值，不是时长；<code>ms</code> 是在 H200 上用 CUDA 事件测出来的。两者没有相除，
+也不互相换算。另外，被测的 Triton twin 由<b>人</b>编写、由 <b>Triton</b> 编译，
+不是 TileFoundry CodeGen 的产物。
+</div>
+
+<h2>1. 用户目标与分工</h2>
+<div class="flow">用户目标：让 RMSNorm + FP8 量化在 H200 上真实跑通，且每步都有真实来源、实际命令与独立验证
+   │
+   ├─ Agent          写 HIR、读编译器反馈、改方案、挑候选
+   ├─ TileFoundry    语义判定（check）、静态代价（analyze）、布局与存储层级校验
+   ├─ Triton         编译运行期 twin（不归 TileFoundry）
+   └─ CUDAGPU        真实执行与计时（H200）</div>
+
+<h2>2. Expected Fail → Repair → PASS</h2>
+<h3>第一次写入的 HIR（先乘 gamma 再舍入） <span class="fail">exit 1</span></h3><table><tr><th>谓词与数值</th><th class='num'>判定</th></tr><tr><td class='mono'>equal                              mismatched 432 elements 14336</td><td><span class="fail">FAIL</span></td></tr><tr><td class='mono'>allclose(atol=1e-06 rtol=1e-06)    max_violation 6.87445e-05</td><td><span class="fail">FAIL</span></td></tr></table>
+<h3>修复后（先舍入到 bf16 再乘 gamma） <span class="pass">exit 0</span></h3><table><tr><th>谓词与数值</th><th class='num'>判定</th></tr><tr><td class='mono'>equal                              mismatched 0 elements 14336</td><td><span class="pass">PASS</span></td></tr><tr><td class='mono'>allclose(atol=1e-06 rtol=1e-06)    max_violation 0</td><td><span class="pass">PASS</span></td></tr></table>
+<p class="dim">容差全程未改动（<code>atol=1e-6</code>, <code>rtol=1e-6</code>）。
+修复后 <code>max_violation</code> 是 0，不是恰好压在容差以内。</p>
+
+<h2>3. Naive 与 Fused 的对比</h2>
+<table>
+<tr><th>placement</th><th class="num">静态 ideal-ns</th><th>约束</th></tr>
+<tr><td>Naive（未融合）</td><td class='num'>8697</td><td>memory</td></tr><tr><td>Fused（融合）</td><td class='num'>3755</td><td>memory</td></tr><tr><td>Agent 候选</td><td class='num'>3755</td><td>memory</td></tr>
+</table>
+<p class="dim">8697 与 3755 都是字节数除以带宽的模型值，不是测量。
+Agent 候选与 Fused 同为 3755：激活值从 rmem 搬到了 smem，字节数没变，模型时间也没变。</p>
+<p class="dim">Naive 的源码有两个函数，<code>analyze</code> 因此报出两组数字
+（8697, 4952）；取第一组，它是入口函数。</p>
+
+<h2>4. 真实 GPU 测量（与上表分开）</h2>
+<div class="barrow"><span>torch 基线</span><span class="bar" style="width:100.00%;background:#f0a03c"></span><span class='num'>0.10782 ms</span></div><div class="barrow"><span>Triton twin</span><span class="bar" style="width:23.80%;background:#4da3ff"></span><span class='num'>0.02566 ms</span></div>
+<table>
+<tr><th>加速比（torch 基线 ÷ Triton twin）</th><th class="num">值</th></tr>
+<tr><td>最小</td><td class="num">4.09×</td></tr>
+<tr><td>中位</td><td class="num">4.18×</td></tr>
+<tr><td>最大</td><td class="num">4.23×</td></tr>
+</table>
+<p class="dim">5 轮逐轮交替计时，10 次预热、每轮 100 次重复。
+FP8 结果一致性：<code>quant_equal_fraction</code> = 0.999999463558197，
+<code>scale_max_abs_diff</code> = 0.0。</p>
+
+<h2>5. Agent 候选的去留</h2>
+<p><span class="pass">正确性 PASS</span>，但 <span class="fail">性能目标未达成</span>。<code>tilefoundry check agent_candidate.py:SplitMetaChecked</code>
+退出码 0，两个谓词均通过；<code>tilefoundry analyze</code> 报告
+<code>ideal-ns=3755</code>，与 Fused 相同。
+假设是"片上驻留是瓶颈"，报告否掉了这个假设：约束在 GMEM 上。</p>
+
+<h2>6. 按时间顺序的协作事件</h2>
+<p class="dim">共 17 条事件。左列 Agent，右列 Compiler / Runtime。</p>
+<div class="timeline"><div class="head">阶段 / 事件</div><div class="head side-agent">Agent 侧</div><div class="head side-compiler">Compiler / Runtime 侧</div><div class="row"><div class="cell mono dim">P2-1</div><div class="cell agent"><details class="event" data-stage="P2-1" data-actor="AGENT"><summary><span class="id">E003</span><span class="act">read the semantic failure and reorder the rounding</span> <span class="dim">n/a</span><p class="sum">Both predicates failed with the same cause: the bf16 rounding happened after the gamma multiply instead of before it. The agent moved the cast ahead of the multiply, which is the model&#x27;s own definition of the step.</p></summary><div class="body"><dl><dt>event_id</dt><dd class='mono'>E003</dd><dt>iteration_id</dt><dd class='mono'>P2-1-it01</dd><dt>actor</dt><dd class='mono'>AGENT</dd><dt>run_id</dt><dd class='mono'>20261026-093917-359073</dd><dt>task_id</dt><dd class='mono'>rmsnorm-fp8-tutorial</dd><dt>source_hash</dt><dd class='mono'>820ef140e81d310120e2e6e85a07632e375e5402ba8c6595fc7262c12f8156a0</dd></dl><h3>source diff</h3><pre>normed = tf.cast(rows * tf.rsqrt(mean + EPS) * tf.cast(gamma, &quot;f32&quot;), &quot;bf16&quot;)
+-&gt;  normed = tf.cast(rows * tf.rsqrt(mean + EPS), &quot;bf16&quot;) * gamma</pre><h3>evidence</h3><pre>{
+  &quot;why&quot;: &quot;Quantising after the multiply rounds a scaled value; quantising before it matches expected.pt.&quot;
+}</pre></div></details></div><div class="cell compiler"><details class="event" data-stage="P2-1" data-actor="MODAL_RUNTIME"><summary><span class="id">E001</span><span class="act">start experiment container</span> <span class="dim">n/a</span><p class="sum">Experiments ran on NVIDIA H200 at compute capability [9, 0] with torch 2.9.1+cu128 and python 3.12.15 (main, Oct  1 2026, 15:41:07) [GCC 11.4.0].</p></summary><div class="body"><dl><dt>event_id</dt><dd class='mono'>E001</dd><dt>iteration_id</dt><dd class='mono'>P2-1-it01</dd><dt>actor</dt><dd class='mono'>MODAL_RUNTIME</dd><dt>run_id</dt><dd class='mono'>20261026-093917-359073</dd><dt>task_id</dt><dd class='mono'>rmsnorm-fp8-tutorial</dd><dt>input_artifacts</dt><dd class='mono'>cases/rmsnorm_fp8</dd></dl><h3>evidence</h3><pre>{
+  &quot;compute_capability&quot;: [
+    9,
+    0
+  ],
+  &quot;device&quot;: &quot;cuda&quot;,
+  &quot;experiments_file&quot;: &quot;results/experiments-20261026-110746-743687/experiments.json&quot;,
+  &quot;gpu_name&quot;: &quot;NVIDIA H200&quot;,
+  &quot;library_versions&quot;: {
+    &quot;toolchain_libraries&quot;: &quot;0&quot;
+  },
+  &quot;python&quot;: &quot;3.12.15 (main, Oct  1 2026, 15:41:07) [GCC 11.4.0]&quot;,
+  &quot;torch&quot;: &quot;2.9.1+cu128&quot;
+}</pre></div></details><details class="event" data-stage="P2-1" data-actor="TILEFOUNDRY_CHECK"><summary><span class="id">E002</span><span class="act">check the HIR written from memory</span> <span class="fail">exit 1</span><p class="sum">The first HIR scaled by gamma before rounding to bf16. The checker rejected it on both outputs, so the semantics were wrong and not merely imprecise.</p></summary><div class="body"><dl><dt>event_id</dt><dd class='mono'>E002</dd><dt>iteration_id</dt><dd class='mono'>P2-1-it01</dd><dt>actor</dt><dd class='mono'>TILEFOUNDRY_CHECK</dd><dt>run_id</dt><dd class='mono'>20261026-093917-359073</dd><dt>task_id</dt><dd class='mono'>rmsnorm-fp8-tutorial</dd><dt>source_hash</dt><dd class='mono'>820ef140e81d310120e2e6e85a07632e375e5402ba8c6595fc7262c12f8156a0</dd><dt>input_artifacts</dt><dd class='mono'>x.pt, ckpt/gamma.pt, expected.pt</dd><dt>output_artifacts</dt><dd class='mono'>rms_norm_quant.py:rms_norm_quant.py:Wrong</dd></dl><h3>command</h3><pre>tilefoundry tilefoundry check rms_norm_quant.py:Wrong --inputs files:x.pt --weights ckpt:. --expected expected.pt --device cuda --out output[0] --fn equal --out output[1] --fn allclose --atol 1e-6 --rtol 1e-6</pre><h3>谓词结果</h3><pre>equal                              mismatched 432 elements 14336 FAIL
+allclose(atol=1e-06 rtol=1e-06)    max_violation 6.87445e-05  FAIL
+FAIL
+warning: FAIL says the candidate and reference differ, not which side is closer to</pre></div></details><details class="event" data-stage="P2-1" data-actor="TILEFOUNDRY_CHECK"><summary><span class="id">E004</span><span class="act">re-check the repaired HIR</span> <span class="pass">exit 0</span><p class="sum">The repaired HIR matched both outputs exactly.</p></summary><div class="body"><dl><dt>event_id</dt><dd class='mono'>E004</dd><dt>iteration_id</dt><dd class='mono'>P2-1-it01</dd><dt>actor</dt><dd class='mono'>TILEFOUNDRY_CHECK</dd><dt>run_id</dt><dd class='mono'>20261026-093917-359073</dd><dt>task_id</dt><dd class='mono'>rmsnorm-fp8-tutorial</dd><dt>source_hash</dt><dd class='mono'>820ef140e81d310120e2e6e85a07632e375e5402ba8c6595fc7262c12f8156a0</dd><dt>input_artifacts</dt><dd class='mono'>x.pt, ckpt/gamma.pt, expected.pt</dd><dt>output_artifacts</dt><dd class='mono'>rms_norm_quant.py:rms_norm_quant.py:RmsNormQuant</dd></dl><h3>command</h3><pre>tilefoundry tilefoundry check rms_norm_quant.py:RmsNormQuant --inputs files:x.pt --weights ckpt:. --expected expected.pt --device cuda --out output[0] --fn equal --out output[1] --fn allclose --atol 1e-6 --rtol 1e-6</pre><h3>谓词结果</h3><pre>equal                              mismatched 0 elements 14336 PASS
+allclose(atol=1e-06 rtol=1e-06)    max_violation 0            PASS
+PASS</pre></div></details></div></div><div class="row"><div class="cell mono dim">P2-2</div><div class="cell agent"><details class="event" data-stage="P2-2" data-actor="AGENT"><summary><span class="id">E007</span><span class="act">choose the fused placement from the memory report</span> <span class="dim">n/a</span><p class="sum">Both placements are bound by memory, so arithmetic is not the lever. The memory report showed the unfused placement reading 3.61 MiB more from gmem and writing 3.61 MiB more, and the fused placement has no such round trip, so the agent selected fusion.</p></summary><div class="body"><dl><dt>event_id</dt><dd class='mono'>E007</dd><dt>iteration_id</dt><dd class='mono'>P2-2-it02</dd><dt>actor</dt><dd class='mono'>AGENT</dd><dt>run_id</dt><dd class='mono'>20261026-093917-359073</dd><dt>task_id</dt><dd class='mono'>rmsnorm-fp8-tutorial</dd><dt>source_hash</dt><dd class='mono'>777313eddeea5e24da438409a3da503a992d9d9da3d0a0c6b5dad44928142e0f</dd></dl><h3>evidence</h3><pre>{
+  &quot;bound_by&quot;: &quot;memory&quot;,
+  &quot;decisive_metric&quot;: &quot;gmem read and write of the intermediate rows&quot;,
+  &quot;fused_gmem&quot;: &quot;r3.62MiB/w1.86MiB@logical&quot;,
+  &quot;naive_gmem&quot;: &quot;r7.23MiB/w5.47MiB@logical&quot;
+}</pre></div></details></div><div class="cell compiler"><details class="event" data-stage="P2-2" data-actor="TILEFOUNDRY_ANALYZE"><summary><span class="id">E005</span><span class="act">price the Naive placement</span> <span class="pass">exit 0</span><p class="sum">Naive reports roofline ideal-ns=8697 bound-by=memory; The unfused placement pays for writing the normalized rows and reading them back.</p></summary><div class="body"><dl><dt>event_id</dt><dd class='mono'>E005</dd><dt>iteration_id</dt><dd class='mono'>P2-2-it02</dd><dt>actor</dt><dd class='mono'>TILEFOUNDRY_ANALYZE</dd><dt>run_id</dt><dd class='mono'>20261026-093917-359073</dd><dt>task_id</dt><dd class='mono'>rmsnorm-fp8-tutorial</dd><dt>source_hash</dt><dd class='mono'>777313eddeea5e24da438409a3da503a992d9d9da3d0a0c6b5dad44928142e0f</dd><dt>input_artifacts</dt><dd class='mono'>rms_norm_quant_opt.py</dd><dt>output_artifacts</dt><dd class='mono'>analysis/Naive.txt</dd></dl><h3>command</h3><pre>tilefoundry tilefoundry analyze rms_norm_quant_opt.py:Naive /tmp/rmsnorm_fp8-uvy49xpn/analysis_naive.txt --compute-cost --memory --roofline</pre><h3>roofline</h3><pre># roofline ideal-ns=8697 bound-by=memory
+# roofline ideal-ns=4952 bound-by=memory</pre><h3>memory</h3><pre># memory traffic=gmem:r7.23MiB/w5.47MiB@logical,r9.02MiB/w5.47MiB@total,r70.00KiB/w42.44KiB@cta,r336B/w224B@thread;rmem:r74.18MiB/w59.68MiB@logical,r75.97MiB/w61.48MiB@total,r589.35KiB/w476.90KiB@cta,r2.54KiB/w2.04KiB@thread footprint=a:3.61MiB;gamma:14.00KiB;norm::v11:7.22MiB;v13:1.80MiB;v15:57.75KiB footprint-precision=exact peak=gmem:7.23MiB;rmem:112.01KiB persistent=gmem:3.62MiB
+# memory traffic=gmem:r3.62MiB/w3.61MiB@logical,r5.41MiB/w3.61MiB@total,r42.00KiB/w28.00KiB@cta,r224B/w112B@thread;rmem:r39.72MiB/w32.50MiB@logical,r41.51MiB/w34.29MiB@total,r322.03KiB/w266.02KiB@cta,r1.33KiB/w1.11KiB@thread footprint=a:3.61MiB;gamma:14.00KiB;v11:3.61MiB footprint-precision=exact</pre><h3>evidence</h3><pre>{
+  &quot;report_path&quot;: &quot;analysis/Naive.txt&quot;
+}</pre></div></details><details class="event" data-stage="P2-2" data-actor="TILEFOUNDRY_ANALYZE"><summary><span class="id">E006</span><span class="act">price the Fused placement</span> <span class="pass">exit 0</span><p class="sum">Fused reports roofline ideal-ns=3755 bound-by=memory; The fused placement keeps the rows on chip and writes only the quantized result and its scale.</p></summary><div class="body"><dl><dt>event_id</dt><dd class='mono'>E006</dd><dt>iteration_id</dt><dd class='mono'>P2-2-it02</dd><dt>actor</dt><dd class='mono'>TILEFOUNDRY_ANALYZE</dd><dt>run_id</dt><dd class='mono'>20261026-093917-359073</dd><dt>task_id</dt><dd class='mono'>rmsnorm-fp8-tutorial</dd><dt>source_hash</dt><dd class='mono'>777313eddeea5e24da438409a3da503a992d9d9da3d0a0c6b5dad44928142e0f</dd><dt>input_artifacts</dt><dd class='mono'>rms_norm_quant_opt.py</dd><dt>output_artifacts</dt><dd class='mono'>analysis/Fused.txt</dd></dl><h3>command</h3><pre>tilefoundry tilefoundry analyze rms_norm_quant_opt.py:Fused /tmp/rmsnorm_fp8-uvy49xpn/analysis_fused.txt --compute-cost --memory --roofline</pre><h3>roofline</h3><pre># roofline ideal-ns=3755 bound-by=memory</pre><h3>memory</h3><pre># memory traffic=gmem:r3.62MiB/w1.86MiB@logical,r5.41MiB/w1.86MiB@total,r42.00KiB/w14.44KiB@cta,r224B/w112B@thread;rmem:r70.57MiB/w56.07MiB@logical,r72.36MiB/w57.87MiB@total,r561.35KiB/w448.90KiB@cta,r2.43KiB/w1.93KiB@thread footprint=a:3.61MiB;gamma:14.00KiB;v22:1.80MiB;v24:57.75KiB footprint-precision=exact peak=gmem:5.48MiB;rmem:112.01KiB persistent=gmem:3.62MiB</pre><h3>evidence</h3><pre>{
+  &quot;report_path&quot;: &quot;analysis/Fused.txt&quot;
+}</pre></div></details></div></div><div class="row"><div class="cell mono dim">P2-3</div><div class="cell agent"></div><div class="cell compiler"><details class="event" data-stage="P2-3" data-actor="TRITON_COMPILER"><summary><span class="id">E008</span><span class="act">compile the runtime twin</span> <span class="pass">exit 0</span><p class="sum">Triton 3.5.1 compiled the twin that ``twin.py`` states. The twin is a Triton kernel, so its compilation belongs to Triton and not to TileFoundry codegen.</p></summary><div class="body"><dl><dt>event_id</dt><dd class='mono'>E008</dd><dt>iteration_id</dt><dd class='mono'>P2-3-it03</dd><dt>actor</dt><dd class='mono'>TRITON_COMPILER</dd><dt>run_id</dt><dd class='mono'>20261026-093917-359073</dd><dt>task_id</dt><dd class='mono'>rmsnorm-fp8-tutorial</dd><dt>source_hash</dt><dd class='mono'>190fafdb2d0e9af8b4ee696568037d17ce84afaf88d02643b6ac10db521f4410</dd><dt>input_artifacts</dt><dd class='mono'>twin.py</dd><dt>output_artifacts</dt><dd class='mono'>triton_jit_cache</dd></dl><h3>command</h3><pre>tilefoundry tilefoundry check twin.py:Fast --inputs files:x.pt --weights ckpt:. --expected expected.pt --device cuda --out output[0] --fn equal --out output[1] --fn allclose --atol 1e-6 --rtol 1e-6</pre><h3>谓词结果</h3><pre>equal                              mismatched 0 elements 14336 PASS
+allclose(atol=1e-06 rtol=1e-06)    max_violation 0            PASS
+PASS</pre><h3>evidence</h3><pre>{
+  &quot;attribution&quot;: &quot;TRITON_COMPILER, not TileFoundry codegen&quot;,
+  &quot;triton_version&quot;: &quot;3.5.1&quot;
+}</pre></div></details></div></div><div class="row"><div class="cell mono dim">P2-4</div><div class="cell agent"><details class="event" data-stage="P2-4" data-actor="AGENT"><summary><span class="id">E010</span><span class="act">decide whether the measurement supports a conclusion</span> <span class="dim">n/a</span><p class="sum">The speedup is reported as a range over rounds, not as a single ratio, because the per-round medians move by more than the gap between the arms. The static ideal-ns figures are not divided by these times; they are a different model.</p></summary><div class="body"><dl><dt>event_id</dt><dd class='mono'>E010</dd><dt>iteration_id</dt><dd class='mono'>P2-4-it04</dd><dt>actor</dt><dd class='mono'>AGENT</dd><dt>run_id</dt><dd class='mono'>20261026-093917-359073</dd><dt>task_id</dt><dd class='mono'>rmsnorm-fp8-tutorial</dd></dl><h3>evidence</h3><pre>{
+  &quot;not_a_speedup_claim_from_static_model&quot;: &quot;These are measured latencies. The Naive/Fused roofline ideal-ns values are a static model of a different (HIR) program and are never divided by these numbers.&quot;,
+  &quot;per_round&quot;: [
+    {
+      &quot;round&quot;: 0,
+      &quot;torch_median_ms&quot;: 0.10831999778747559,
+      &quot;triton_median_ms&quot;: 0.026464000344276428
+    },
+    {
+      &quot;round&quot;: 1,
+      &quot;torch_median_ms&quot;: 0.1085279993712902,
+      &quot;triton_median_ms&quot;: 0.02566399984061718
+    },
+    {
+      &quot;round&quot;: 2,
+      &quot;torch_median_ms&quot;: 0.10782400146126747,
+      &quot;triton_median_ms&quot;: 0.026064000092446804
+    },
+    {
+      &quot;round&quot;: 3,
+      &quot;torch_median_ms&quot;: 0.1064159981906414,
+      &quot;triton_median_ms&quot;: 0.025488000363111496
+    },
+    {
+      &quot;round&quot;: 4,
+      &quot;torch_median_ms&quot;: 0.1069600023329258,
+      &quot;triton_median_ms&quot;: 0.025536000728607178
+    }
+  ],
+  &quot;speedup&quot;: {
+    &quot;max&quot;: 4.228802994283384,
+    &quot;median&quot;: 4.1751411124686,
+    &quot;min&quot;: 4.093107481042743
+  }
+}</pre></div></details></div><div class="cell compiler"><details class="event" data-stage="P2-4" data-actor="GPU_BENCHMARK"><summary><span class="id">E009</span><span class="act">time the torch baseline against the Triton twin</span> <span class="pass">exit 0</span><p class="sum">RMSNorm + FP8 block quantization, warm-kernel latency. Across rounds the torch baseline took 0.10782 ms and the twin 0.02566 ms.</p></summary><div class="body"><dl><dt>event_id</dt><dd class='mono'>E009</dd><dt>iteration_id</dt><dd class='mono'>P2-4-it04</dd><dt>actor</dt><dd class='mono'>GPU_BENCHMARK</dd><dt>run_id</dt><dd class='mono'>20261026-093917-359073</dd><dt>task_id</dt><dd class='mono'>rmsnorm-fp8-tutorial</dd><dt>source_hash</dt><dd class='mono'>cb3cb14f89bea78ad6e1689b39057e2b92de26f83f61da5a90fa906a45262926</dd><dt>input_artifacts</dt><dd class='mono'>benchmark.py, twin.py</dd><dt>output_artifacts</dt><dd class='mono'>benchmark.json</dd></dl><h3>command</h3><pre>python3 /usr/bin/python benchmark.py</pre><h3>evidence</h3><pre>{
+  &quot;agreement&quot;: {
+    &quot;quant_equal_fraction&quot;: 0.999999463558197,
+    &quot;scale_max_abs_diff&quot;: 0.0
+  },
+  &quot;arms&quot;: {
+    &quot;torch_baseline&quot;: {
+      &quot;max_ms&quot;: 0.14732800424098969,
+      &quot;mean_ms&quot;: 0.11037247970700265,
+      &quot;median_ms&quot;: 0.10684800148010254,
+      &quot;min_ms&quot;: 0.10073599964380264,
+      &quot;p10_ms&quot;: 0.10409600287675858,
+      &quot;p90_ms&quot;: 0.12092799693346024,
+      &quot;repeats&quot;: 100,
+      &quot;samples_ms&quot;: [
+        0.13148799538612366,
+        0.1117440015077591,
+        0.11107199639081955,
+        0.10915199667215347,
+        0.11023999750614166,
+        0.10387200117111206,
+        0.11660800129175186,
+        0.10672000050544739,
+        0.11052799969911575,
+        0.10316800326108932,
+        0.10608000308275223,
+        0.1043199971318245,
+        0.10822399705648422,
+        0.10236799716949463,
+        0.10543999820947647,
+        0.10451199859380722,
+        0.10700800269842148,
+        0.10073599964380264,
+        0.10697600245475769,
+        0.10502400249242783,
+        0.10665600001811981,
+        0.1019200012087822,
+        0.10572800040245056,
+        0.10521599650382996,
+        0.11987199634313583,
+        0.13209599256515503,
+        0.14556799829006195,
+        0.14732800424098969,
+        0.11081600189208984,
+        0.10825599730014801,
+        0.10569600015878677,
+        0.10627199709415436,
+        0.12611199915409088,
+        0.11740799993276596,
+        0.11219199746847153,
+        0.1130559965968132,
+        0.10633599758148193,
+        0.10822399705648422,
+        0.10518400371074677,
+        0.11001600325107574,
+        0.10492800176143646,
+        0.10595200210809708,
+        0.10889600217342377,
+        0.10534399747848511,
+        0.10623999685049057,
+        0.11366400122642517,
+        0.10675200074911118,
+        0.10358399897813797,
+        0.10649599879980087,
+        0.1069440022110939,
+        0.10719999670982361,
+        0.10409600287675858,
+        0.10534399747848511,
+        0.10451199859380722,
+        0.1058880016207695,
+        0.10147199779748917,
+        0.10630399733781815,
+        0.10492800176143646,
+        0.1231359988451004,
+        0.13091200590133667,
+        0.11299200356006622,
+        0.10579200088977814,
+        0.10918399691581726,
+        0.10777600109577179,
+        0.11315199732780457,
+        0.10358399897813797,
+        0.10742399841547012,
+        0.1391039937734604,
+        0.11478400230407715,
+        0.1072319969534874,
+        0.11180800199508667,
+        0.1090560033917427,
+        0.11161600053310394,
+        0.10864000022411346,
+        0.10927999764680862,
+        0.10576000064611435,
+        0.10822399705648422,
+        0.10569600015878677,
+        0.10963200032711029,
+        0.10566399991512299,
+        0.1066880002617836,
+        0.10604800283908844,
+        0.10172799974679947,
+        0.10675200074911118,
+        0.10633599758148193,
+        0.10627199709415436,
+        0.10380800068378448,
+        0.10793600231409073,
+        0.10435199737548828,
+        0.10559999942779541,
+        0.10499200224876404,
+        0.10579200088977814,
+        0.10470400005578995,
+        0.13884800672531128,
+        0.12092799693346024,
+        0.11926399916410446,
+        0.12464000284671783,
+        0.12038400024175644,
+        0.10719999670982361,
+        0.10675200074911118
+      ],
+      &quot;stdev_ms&quot;: 0.00918763538081763,
+      &quot;warmup&quot;: 10
+    },
+    &quot;triton_twin&quot;: {
+      &quot;max_ms&quot;: 0.04303999990224838,
+      &quot;mean_ms&quot;: 0.02688384000211954,
+      &quot;median_ms&quot;: 0.025520000606775284,
+      &quot;min_ms&quot;: 0.023871999233961105,
+      &quot;p10_ms&quot;: 0.0244159996509552,
+      &quot;p90_ms&quot;: 0.030432000756263733,
+      &quot;repeats&quot;: 100,
+      &quot;samples_ms&quot;: [
+        0.035551998764276505,
+        0.02908799983561039,
+        0.028704000636935234,
+        0.02703999914228916,
+        0.026784000918269157,
+        0.024639999493956566,
+        0.02579200081527233,
+        0.025087999179959297,
+        0.04303999990224838,
+        0.04134399816393852,
+        0.0352960005402565,
+        0.03161599859595299,
+        0.02860799990594387,
+        0.026655999943614006,
+        0.031231999397277832,
+        0.029600000008940697,
+        0.03081599995493889,
+        0.029055999591946602,
+        0.03097599931061268,
+        0.02940800040960312,
+        0.03017600066959858,
+        0.029120000079274178,
+        0.029952000826597214,
+        0.02985600009560585,
+        0.030432000756263733,
+        0.029472000896930695,
+        0.03001599945127964,
+        0.029311999678611755,
+        0.025728000327944756,
+        0.02470399998128414,
+        0.025728000327944756,
+        0.024831999093294144,
+        0.025919999927282333,
+        0.024671999737620354,
+        0.025855999439954758,
+        0.0244159996509552,
+        0.025599999353289604,
+        0.037728000432252884,
+        0.031968001276254654,
+        0.02860799990594387,
+        0.028991999104619026,
+        0.02723200060427189,
+        0.02768000029027462,
+        0.025631999596953392,
+        0.02627200074493885,
+        0.024671999737620354,
+        0.025919999927282333,
+        0.02489599958062172,
+        0.025536000728607178,
+        0.025280000641942024,
+        0.025728000327944756,
+        0.024288000538945198,
+        0.026784000918269157,
+        0.02505600079894066,
+        0.02598400041460991,
+        0.02454400062561035,
+        0.02550400048494339,
+        0.024288000538945198,
+        0.025407999753952026,
+        0.024800000712275505,
+        0.025439999997615814,
+        0.02454400062561035,
+        0.02579200081527233,
+        0.024800000712275505,
+        0.025407999753952026,
+        0.0244159996509552,
+        0.025567999109625816,
+        0.024607999250292778,
+        0.025599999353289604,
+        0.02489599958062172,
+        0.02537599951028824,
+        0.0244159996509552,
+        0.02598400041460991,
+        0.024607999250292778,
+        0.02537599951028824,
+        0.024768000468611717,
+        0.025760000571608543,
+        0.024320000782608986,
+        0.025407999753952026,
+        0.024480000138282776,
+        0.025248000398278236,
+        0.023871999233961105,
+        0.025439999997615814,
+        0.02412799932062626,
+        0.02534399926662445,
+        0.024288000538945198,
+        0.025248000398278236,
+        0.0244159996509552,
+        0.025087999179959297,
+        0.02457600086927414,
+        0.02537599951028824,
+        0.02425600029528141,
+        0.02521600015461445,
+        0.024351999163627625,
+        0.025312000885605812,
+        0.024639999493956566,
+        0.02518399991095066,
+        0.024512000381946564,
+        0.025472000241279602,
+        0.025919999927282333
+      ],
+      &quot;stdev_ms&quot;: 0.0034532012740802237,
+      &quot;warmup&quot;: 10
+    }
+  },
+  &quot;comparison&quot;: {
+    &quot;baseline&quot;: &quot;torch_baseline: the same step as unfused PyTorch tensor ops&quot;,
+    &quot;candidate&quot;: &quot;triton_twin: the Triton kernel from the tutorial&#x27;s twin&quot;,
+    &quot;median_of_round_medians_ms&quot;: {
+      &quot;torch_baseline&quot;: 0.10782400146126747,
+      &quot;triton_twin&quot;: 0.02566399984061718
+    },
+    &quot;per_round&quot;: [
+      {
+        &quot;round&quot;: 0,
+        &quot;torch_median_ms&quot;: 0.10831999778747559,
+        &quot;triton_median_ms&quot;: 0.026464000344276428
+      },
+      {
+        &quot;round&quot;: 1,
+        &quot;torch_median_ms&quot;: 0.1085279993712902,
+        &quot;triton_median_ms&quot;: 0.02566399984061718
+      },
+      {
+        &quot;round&quot;: 2,
+        &quot;torch_median_ms&quot;: 0.10782400146126747,
+        &quot;triton_median_ms&quot;: 0.026064000092446804
+      },
+      {
+        &quot;round&quot;: 3,
+        &quot;torch_median_ms&quot;: 0.1064159981906414,
+        &quot;triton_median_ms&quot;: 0.025488000363111496
+      },
+      {
+        &quot;round&quot;: 4,
+        &quot;torch_median_ms&quot;: 0.1069600023329258,
+        &quot;triton_median_ms&quot;: 0.025536000728607178
+      }
+    ],
+    &quot;rounds&quot;: 5,
+    &quot;speedup_torch_over_triton&quot;: {
+      &quot;max&quot;: 4.228802994283384,
+      &quot;median&quot;: 4.1751411124686,
+      &quot;min&quot;: 4.093107481042743
+    },
+    &quot;what_this_is_not&quot;: &quot;not a comparison of the compiler against PyTorch: both arms are hand-written kernels/ops, and the HIR ideal-ns figures describe a different program, so they are never divided by these numbers&quot;
+  },
+  &quot;dtypes&quot;: {
+    &quot;input&quot;: &quot;bfloat16&quot;,
+    &quot;quant&quot;: &quot;float8_e4m3fn&quot;,
+    &quot;scale&quot;: &quot;float32&quot;
+  },
+  &quot;jit_compile&quot;: &quot;excluded; each arm warmed up before timing&quot;,
+  &quot;measured_region&quot;: &quot;whole step: (a, gamma) -&gt; (quant, scale), allocation and Python launch included&quot;,
+  &quot;seed&quot;: 0,
+  &quot;shape&quot;: {
+    &quot;block&quot;: 128,
+    &quot;blocks&quot;: 56,
+    &quot;h&quot;: 7168,
+    &quot;rows&quot;: 264
+  },
+  &quot;versions&quot;: {
+    &quot;cuda_driver&quot;: null,
+    &quot;python&quot;: &quot;3.12.15&quot;,
+    &quot;torch&quot;: &quot;2.9.1+cu128&quot;,
+    &quot;torch_cuda&quot;: &quot;12.8&quot;,
+    &quot;triton&quot;: &quot;3.5.1&quot;
+  }
+}</pre></div></details></div></div><div class="row"><div class="cell mono dim">P2-5</div><div class="cell agent"></div><div class="cell compiler"><details class="event" data-stage="P2-5" data-actor="TILEFOUNDRY_CHECK"><summary><span class="id">E011</span><span class="act">check the agent&#x27;s third placement</span> <span class="pass">exit 0</span><p class="sum">The agent&#x27;s own placement passed both predicates, so the compiler accepted it as a correct realisation of the step. Acceptance is a correctness verdict, not a performance verdict.</p></summary><div class="body"><dl><dt>event_id</dt><dd class='mono'>E011</dd><dt>iteration_id</dt><dd class='mono'>P2-5-it05</dd><dt>actor</dt><dd class='mono'>TILEFOUNDRY_CHECK</dd><dt>run_id</dt><dd class='mono'>20261026-093917-359073</dd><dt>task_id</dt><dd class='mono'>rmsnorm-fp8-tutorial</dd><dt>source_hash</dt><dd class='mono'>8f2ceaeee0970ff773afe245466a8cc38a8808bc49fae153c6b02e363f8fcd8e</dd><dt>input_artifacts</dt><dd class='mono'>x.pt, ckpt/gamma.pt, expected.pt</dd><dt>output_artifacts</dt><dd class='mono'>agent_candidate.py:SplitMetaChecked</dd></dl><h3>command</h3><pre>tilefoundry tilefoundry check agent_candidate.py:SplitMetaChecked --inputs files:x.pt --weights ckpt:. --expected expected.pt --device cuda --out output[0] --fn equal --out output[1] --fn allclose --atol 1e-6 --rtol 1e-6</pre><h3>谓词结果</h3><pre>equal                              mismatched 0 elements 14336 PASS
+allclose(atol=1e-06 rtol=1e-06)    max_violation 0            PASS
+PASS</pre></div></details><details class="event" data-stage="P2-5" data-actor="TILEFOUNDRY_ANALYZE"><summary><span class="id">E012</span><span class="act">price the agent&#x27;s placement</span> <span class="pass">exit 0</span><p class="sum">The agent&#x27;s placement reports the same ideal-ns as the fused placement. Moving the activations from rmem to smem left the modelled time unchanged, so the hypothesis was refuted by the same report that suggested it.</p></summary><div class="body"><dl><dt>event_id</dt><dd class='mono'>E012</dd><dt>iteration_id</dt><dd class='mono'>P2-5-it05</dd><dt>actor</dt><dd class='mono'>TILEFOUNDRY_ANALYZE</dd><dt>run_id</dt><dd class='mono'>20261026-093917-359073</dd><dt>task_id</dt><dd class='mono'>rmsnorm-fp8-tutorial</dd><dt>source_hash</dt><dd class='mono'>8f2ceaeee0970ff773afe245466a8cc38a8808bc49fae153c6b02e363f8fcd8e</dd><dt>input_artifacts</dt><dd class='mono'>agent_candidate.py</dd><dt>output_artifacts</dt><dd class='mono'>analysis/agent.txt</dd></dl><h3>command</h3><pre>tilefoundry tilefoundry analyze agent_candidate.py:SplitMeta /tmp/rmsnorm_fp8-uvy49xpn/analysis_agent.txt --compute-cost --memory --roofline</pre><h3>roofline</h3><pre># roofline ideal-ns=3755 bound-by=memory</pre><h3>memory</h3><pre># memory traffic=gmem:r3.62MiB/w1.86MiB@logical,r5.41MiB/w1.86MiB@total,r42.00KiB/w14.44KiB@cta,r224B/w112B@thread;rmem:r16B/w0@logical,r2.06KiB/w0@total,r16B/w0@cta,r16B/w0@thread;smem:r70.57MiB/w56.07MiB@logical,r72.36MiB/w57.87MiB@total,r561.34KiB/w448.90KiB@cta,r2.42KiB/w1.93KiB@thread footprint=a:3.61MiB;gamma:14.00KiB;v22:1.80MiB;v24:57.75KiB footprint-precision=exact peak=gmem:5.48MiB;rmem:0;smem:112.01KiB persistent=gmem:3.62MiB</pre></div></details><details class="event" data-stage="P2-5" data-actor="TILEFOUNDRY_EVALUATOR"><summary><span class="id">E013</span><span class="act">reject the agent&#x27;s attempt 1</span> <span class="dim">n/a</span><p class="sum">A 4-D layout with the CTA axis first is more coarse than the units the multiply runs on.</p></summary><div class="body"><dl><dt>event_id</dt><dd class='mono'>E013</dd><dt>iteration_id</dt><dd class='mono'>P2-5-it01</dd><dt>actor</dt><dd class='mono'>TILEFOUNDRY_EVALUATOR</dd><dt>run_id</dt><dd class='mono'>20261026-093917-359073</dd><dt>task_id</dt><dd class='mono'>rmsnorm-fp8-tutorial</dd><dt>source_hash</dt><dd class='mono'>8f2ceaeee0970ff773afe245466a8cc38a8808bc49fae153c6b02e363f8fcd8e</dd></dl><h3>compiler 反馈原文</h3><pre>Binary: input 0 is laid out more coarsely and kept in rmem, which does not reach the units this runs on; reshard it to smem or gmem first</pre><p><b>Agent 的应对：</b>Followed Fused&#x27;s 3-D sharding exactly instead of inventing a 4-D one.</p><h3>evidence</h3><pre>{
+  &quot;attempt&quot;: 1,
+  &quot;meaning&quot;: &quot;A 4-D layout with the CTA axis first is more coarse than the units the multiply runs on.&quot;,
+  &quot;source&quot;: &quot;cases/rmsnorm_fp8/p2-5-agent-exploration.json&quot;
+}</pre></div></details><details class="event" data-stage="P2-5" data-actor="TILEFOUNDRY_EVALUATOR"><summary><span class="id">E014</span><span class="act">reject the agent&#x27;s attempt 2</span> <span class="dim">n/a</span><p class="sum">Moving only `a` to smem is illegal while `gamma` stays in rmem.</p></summary><div class="body"><dl><dt>event_id</dt><dd class='mono'>E014</dd><dt>iteration_id</dt><dd class='mono'>P2-5-it02</dd><dt>actor</dt><dd class='mono'>TILEFOUNDRY_EVALUATOR</dd><dt>run_id</dt><dd class='mono'>20261026-093917-359073</dd><dt>task_id</dt><dd class='mono'>rmsnorm-fp8-tutorial</dd><dt>source_hash</dt><dd class='mono'>8f2ceaeee0970ff773afe245466a8cc38a8808bc49fae153c6b02e363f8fcd8e</dd></dl><h3>compiler 反馈原文</h3><pre>Binary: operands have conflicting storage (rmem, smem); a multi-input op requires its concrete operands to share one residency</pre><p><b>Agent 的应对：</b>Moved both operands to smem.</p><h3>evidence</h3><pre>{
+  &quot;attempt&quot;: 2,
+  &quot;meaning&quot;: &quot;Moving only `a` to smem is illegal while `gamma` stays in rmem.&quot;,
+  &quot;source&quot;: &quot;cases/rmsnorm_fp8/p2-5-agent-exploration.json&quot;
+}</pre></div></details><details class="event" data-stage="P2-5" data-actor="TILEFOUNDRY_EVALUATOR"><summary><span class="id">E015</span><span class="act">reject the agent&#x27;s attempt 3</span> <span class="dim">n/a</span><p class="sum">A smem-resident sharded value cannot be reshaped to (ROWS, BLOCKS, BLOCK) when the CTA axis carries no genuine split (1 CTA for a 2-row checked shape).</p></summary><div class="body"><dl><dt>event_id</dt><dd class='mono'>E015</dd><dt>iteration_id</dt><dd class='mono'>P2-5-it03</dd><dt>actor</dt><dd class='mono'>TILEFOUNDRY_EVALUATOR</dd><dt>run_id</dt><dd class='mono'>20261026-093917-359073</dd><dt>task_id</dt><dd class='mono'>rmsnorm-fp8-tutorial</dd><dt>source_hash</dt><dd class='mono'>8f2ceaeee0970ff773afe245466a8cc38a8808bc49fae153c6b02e363f8fcd8e</dd></dl><h3>compiler 反馈原文</h3><pre>Reshape cannot express the sharded layout: new shape does not align with the input layout factorization</pre><p><b>Agent 的应对：</b>Separated the analysis variant (264 rows, real split) from a checked variant at the 2-row shape the checking inputs carry.</p><h3>evidence</h3><pre>{
+  &quot;attempt&quot;: 3,
+  &quot;meaning&quot;: &quot;A smem-resident sharded value cannot be reshaped to (ROWS, BLOCKS, BLOCK) when the CTA axis carries no genuine split (1 CTA for a 2-row checked shape).&quot;,
+  &quot;source&quot;: &quot;cases/rmsnorm_fp8/p2-5-agent-exploration.json&quot;
+}</pre></div></details><details class="event" data-stage="P2-5" data-actor="TILEFOUNDRY_EVALUATOR"><summary><span class="id">E016</span><span class="act">reject the agent&#x27;s attempt 4</span> <span class="dim">n/a</span><p class="sum">The 264-row thread mesh subdivides rows by PAIR*4=8, which does not divide 2.</p></summary><div class="body"><dl><dt>event_id</dt><dd class='mono'>E016</dd><dt>iteration_id</dt><dd class='mono'>P2-5-it04</dd><dt>actor</dt><dd class='mono'>TILEFOUNDRY_EVALUATOR</dd><dt>run_id</dt><dd class='mono'>20261026-093917-359073</dd><dt>task_id</dt><dd class='mono'>rmsnorm-fp8-tutorial</dd><dt>source_hash</dt><dd class='mono'>8f2ceaeee0970ff773afe245466a8cc38a8808bc49fae153c6b02e363f8fcd8e</dd></dl><h3>compiler 反馈原文</h3><pre>default_shard_layout: logical axis 0 size 2 is not divisible by mesh extent product 4 (role &#x27;layout&#x27;)</pre><p><b>Agent 的应对：</b>Followed the tutorial&#x27;s checked modules and used one CTA with no explicit resharding for the checked variant.</p><h3>evidence</h3><pre>{
+  &quot;attempt&quot;: 4,
+  &quot;meaning&quot;: &quot;The 264-row thread mesh subdivides rows by PAIR*4=8, which does not divide 2.&quot;,
+  &quot;source&quot;: &quot;cases/rmsnorm_fp8/p2-5-agent-exploration.json&quot;
+}</pre></div></details><details class="event" data-stage="P2-5" data-actor="TILEFOUNDRY_EVALUATOR"><summary><span class="id">E017</span><span class="act">reject the agent&#x27;s attempt 5</span> <span class="dim">n/a</span><p class="sum">The checked module declared 264 rows while x.pt carries 2.</p></summary><div class="body"><dl><dt>event_id</dt><dd class='mono'>E017</dd><dt>iteration_id</dt><dd class='mono'>P2-5-it05</dd><dt>actor</dt><dd class='mono'>TILEFOUNDRY_EVALUATOR</dd><dt>run_id</dt><dd class='mono'>20261026-093917-359073</dd><dt>task_id</dt><dd class='mono'>rmsnorm-fp8-tutorial</dd><dt>source_hash</dt><dd class='mono'>8f2ceaeee0970ff773afe245466a8cc38a8808bc49fae153c6b02e363f8fcd8e</dd></dl><h3>compiler 反馈原文</h3><pre>evaluator: shape &#x27;[264, 56, 128]&#x27; is invalid for input of size 14336</pre><p><b>Agent 的应对：</b>Declared the checked row count.</p><h3>evidence</h3><pre>{
+  &quot;attempt&quot;: 5,
+  &quot;meaning&quot;: &quot;The checked module declared 264 rows while x.pt carries 2.&quot;,
+  &quot;source&quot;: &quot;cases/rmsnorm_fp8/p2-5-agent-exploration.json&quot;
+}</pre></div></details></div></div></div>
+
+<h2>7. Agent 决策记录</h2>
+<p class="dim">每条决策在实验前记录了候选与预期效果，再记录实际观测到的效果。
+<code>accepted=false</code> 表示候选被否决或假设被否掉。</p>
+<details class="event"><summary><span class="id">D001</span><span class="act">Make the RMSNorm + FP8 quantisation step match expected.pt.</span> <span class="tag tag-accepted">ACCEPTED</span> <span class="tag tag-replay">GUIDED_TUTORIAL_REPLAY</span><p class="sum">P2-1 · 选中：reorder the arithmetic</p></summary><div class="body"><dl><dt>observations</dt><dd><ul><li>tilefoundry check reported output[0] equal mismatched 432 of 14336 elements and output[1] allclose max_violation 6.87445e-05</li><li>the failing HIR multiplied by gamma and then rounded to bf16</li></ul></dd><dt>candidate_actions</dt><dd><ul><li>loosen the comparison tolerance so the check passes</li><li>reorder the arithmetic so the bf16 rounding happens before the gamma multiply</li></ul></dd><dt>expected_effect</dt><dd>Both predicates pass at the stated tolerance without changing the tolerance, because the failure is a rounding-order error rather than numerical noise.</dd><dt>observed_effect</dt><dd>equal mismatched 0 of 14336; allclose max_violation 0; exit status 0.</dd><dt>reason</dt><dd>The tolerance was not touched. A rounding-order error shows up as exact fp8 mismatches in a small subset of elements, which is what the report showed (432 of 14336), so the repair had to be structural.</dd><dt>evidence_refs</dt><dd class="mono">timeline.jsonl#E002, results/experiments-20261026-110746-743687/experiments.json</dd></dl><h3>source diff</h3><pre>normed = tf.cast(rows * tf.rsqrt(mean + EPS) * tf.cast(gamma, &quot;f32&quot;), &quot;bf16&quot;)
+-&gt;  normed = tf.cast(rows * tf.rsqrt(mean + EPS), &quot;bf16&quot;) * gamma</pre></div></details><details class="event"><summary><span class="id">D002</span><span class="act">Choose between the unfused and the fused placement.</span> <span class="tag tag-accepted">ACCEPTED</span> <span class="tag tag-replay">GUIDED_TUTORIAL_REPLAY</span><p class="sum">P2-2 · 选中：fuse</p></summary><div class="body"><dl><dt>observations</dt><dd><ul><li>Naive ideal-ns=8697 bound-by=memory</li><li>Fused ideal-ns=3755 bound-by=memory</li><li>Naive gmem r7.23MiB/w5.47MiB@logical; Fused gmem r3.62MiB/w1.86MiB@logical</li></ul></dd><dt>candidate_actions</dt><dd><ul><li>optimise the arithmetic, since the step is a reduction plus a quantisation</li><li>fuse the two functions so the normalized rows never reach gmem</li></ul></dd><dt>expected_effect</dt><dd>gmem traffic drops by the round trip of the normalized rows, and the modelled time drops with it.</dd><dt>observed_effect</dt><dd>gmem read and write each dropped 3784704 B (264x7168x2), and ideal-ns fell from 8697 to 3755.</dd><dt>reason</dt><dd>Both placements report bound-by=memory, so arithmetic is not the lever. The traffic that disappeared is exactly the intermediate rows, which is the mechanism fusion was chosen for.</dd><dt>evidence_refs</dt><dd class="mono">timeline.jsonl#E005, timeline.jsonl#E006, timeline.jsonl#E007</dd></dl><h3>source diff</h3><pre>two @func entries (rms_norm, quantize) -&gt; one @func with the intermediate kept on chip</pre></div></details><details class="event"><summary><span class="id">D003</span><span class="act">Decide whether a runtime twin is needed before measuring.</span> <span class="tag tag-accepted">ACCEPTED</span> <span class="tag tag-replay">GUIDED_TUTORIAL_REPLAY</span><p class="sum">P2-3 · 选中：build and check the twin, then time it</p></summary><div class="body"><dl><dt>observations</dt><dd><ul><li>the HIR reports are a static cost model, not a measurement</li><li>the tutorial ships a hand-written Triton kernel that claims a speedup</li></ul></dd><dt>candidate_actions</dt><dd><ul><li>compare the static ideal-ns figures directly against the torch baseline</li><li>build a Triton twin, check it against the same expected.pt, then time it</li></ul></dd><dt>expected_effect</dt><dd>The twin gives a measured counterpart to the static prediction, and checking it first keeps a broken kernel from producing a meaningless time.</dd><dt>observed_effect</dt><dd>The twin passed both predicates on the H200 under Triton 3.5.1, so the timed kernel was correct.</dd><dt>reason</dt><dd>ideal-ns counts bytes divided by bandwidth. It is not a duration, so it cannot be compared to a measured millisecond figure without inventing a conversion.</dd><dt>evidence_refs</dt><dd class="mono">timeline.jsonl#E008</dd></dl></div></details><details class="event"><summary><span class="id">D004</span><span class="act">Decide how to report the measured speedup.</span> <span class="tag tag-accepted">ACCEPTED</span> <span class="tag tag-replay">GUIDED_TUTORIAL_REPLAY</span><p class="sum">P2-4 · 选中：interleave the arms and report a range</p></summary><div class="body"><dl><dt>observations</dt><dd><ul><li>the torch baseline per-round median moved between 0.1078 ms and 0.210 ms across runs</li><li>that movement exceeds the 4.2x gap being described</li><li>timing one arm to completion before the other lets clock variation load onto one arm</li></ul></dd><dt>candidate_actions</dt><dd><ul><li>report a single ratio from one pair of runs</li><li>interleave the arms per round and report the median of per-round medians with a range</li></ul></dd><dt>expected_effect</dt><dd>The reported ratio no longer depends on which arm ran while the device was warmer, and the spread shows how stable it is.</dd><dt>observed_effect</dt><dd>5 alternating rounds gave a torch median of 0.1078 ms against a twin median of 0.02566 ms, a speedup of 4.09x to 4.23x with a median of 4.18x. An earlier run measured 4.44x to 4.58x, a median of 4.52x, so the range across sessions is wider than the range within one session.</dd><dt>reason</dt><dd>A single ratio would have claimed more precision than the measurements support. The range is the honest summary and the session-to-session spread is stated separately.</dd><dt>evidence_refs</dt><dd class="mono">timeline.jsonl#E009, timeline.jsonl#E010</dd></dl></div></details><details class="event"><summary><span class="id">D005</span><span class="act">Find a placement that beats the fused placement.</span> <span class="tag tag-rejected">REJECTED</span> <span class="tag tag-agent">AGENT_EXPERIMENT</span><p class="sum">P2-5 · 选中：keep the fused sharding, move the activations from rmem to smem</p></summary><div class="body"><dl><dt>observations</dt><dd><ul><li>both tutorial placements are bound by memory</li><li>the fused placement already removed the intermediate gmem round trip</li><li>the fused placement still holds the activations in rmem for the whole func: rmem r70.57MiB/w56.07MiB@logical</li></ul></dd><dt>candidate_actions</dt><dd><ul><li>shard the CTA axis first in a 4-D layout</li><li>keep the fused sharding but stage the activations through smem instead of rmem</li></ul></dd><dt>expected_effect</dt><dd>On-chip residency moves to a different memory level while gmem traffic and arithmetic stay the same. If on-chip residency were the limit, the modelled time would fall; if gmem were the limit, it would not move.</dd><dt>observed_effect</dt><dd>ideal-ns stayed at 3755 with bound-by=memory. rmem fell to r16B/w0 and smem took the activations at r70.57MiB/w56.07MiB@logical.</dd><dt>reason</dt><dd>The placement is correct, but it does not lower the modelled time. The hypothesis was that on-chip residency was a limit; the report shows it is not, because gmem is the bound. Recording this as an optimisation would be false.</dd><dt>evidence_refs</dt><dd class="mono">timeline.jsonl#E012, cases/rmsnorm_fp8/p2-5-agent-exploration.json</dd></dl><h3>source diff</h3><pre>held = tf.reshard(a, (ROWS @ (cta.tile, m.x), BLOCKS @ m.y, BLOCK @ m.t), &quot;rmem&quot;)
+-&gt;  held = tf.reshard(a, (ROWS @ (cta.tile, m.x), BLOCKS @ m.y, BLOCK @ m.t), &quot;smem&quot;)
+(and the same change for gamma, because a multi-input op needs one residency)</pre></div></details><details class="event"><summary><span class="id">D006</span><span class="act">Make the agent&#x27;s placement acceptable to the compiler.</span> <span class="tag tag-rejected">REJECTED</span> <span class="tag tag-agent">AGENT_EXPERIMENT</span><p class="sum">P2-5 · 选中：Followed Fused&#x27;s 3-D sharding exactly instead of inventing a 4-D one.</p></summary><div class="body"><dl><dt>observations</dt><dd><ul><li>Binary: input 0 is laid out more coarsely and kept in rmem, which does not reach the units this runs on; reshard it to smem or gmem first</li></ul></dd><dt>candidate_actions</dt><dd><ul><li>Followed Fused&#x27;s 3-D sharding exactly instead of inventing a 4-D one.</li></ul></dd><dt>expected_effect</dt><dd>A 4-D layout with the CTA axis first is more coarse than the units the multiply runs on.</dd><dt>observed_effect</dt><dd>The next attempt produced a different compiler message or was accepted.</dd><dt>reason</dt><dd>The compiler refused the candidate with the message above, so the candidate was revised rather than defended.</dd><dt>evidence_refs</dt><dd class="mono">timeline.jsonl#E013, cases/rmsnorm_fp8/p2-5-agent-exploration.json</dd></dl></div></details><details class="event"><summary><span class="id">D007</span><span class="act">Make the agent&#x27;s placement acceptable to the compiler.</span> <span class="tag tag-rejected">REJECTED</span> <span class="tag tag-agent">AGENT_EXPERIMENT</span><p class="sum">P2-5 · 选中：Moved both operands to smem.</p></summary><div class="body"><dl><dt>observations</dt><dd><ul><li>Binary: operands have conflicting storage (rmem, smem); a multi-input op requires its concrete operands to share one residency</li></ul></dd><dt>candidate_actions</dt><dd><ul><li>Moved both operands to smem.</li></ul></dd><dt>expected_effect</dt><dd>Moving only `a` to smem is illegal while `gamma` stays in rmem.</dd><dt>observed_effect</dt><dd>The next attempt produced a different compiler message or was accepted.</dd><dt>reason</dt><dd>The compiler refused the candidate with the message above, so the candidate was revised rather than defended.</dd><dt>evidence_refs</dt><dd class="mono">timeline.jsonl#E014, cases/rmsnorm_fp8/p2-5-agent-exploration.json</dd></dl></div></details><details class="event"><summary><span class="id">D008</span><span class="act">Make the agent&#x27;s placement acceptable to the compiler.</span> <span class="tag tag-rejected">REJECTED</span> <span class="tag tag-agent">AGENT_EXPERIMENT</span><p class="sum">P2-5 · 选中：Separated the analysis variant (264 rows, real split) from a checked variant at the 2-row shape the checking inputs carry.</p></summary><div class="body"><dl><dt>observations</dt><dd><ul><li>Reshape cannot express the sharded layout: new shape does not align with the input layout factorization</li></ul></dd><dt>candidate_actions</dt><dd><ul><li>Separated the analysis variant (264 rows, real split) from a checked variant at the 2-row shape the checking inputs carry.</li></ul></dd><dt>expected_effect</dt><dd>A smem-resident sharded value cannot be reshaped to (ROWS, BLOCKS, BLOCK) when the CTA axis carries no genuine split (1 CTA for a 2-row checked shape).</dd><dt>observed_effect</dt><dd>The next attempt produced a different compiler message or was accepted.</dd><dt>reason</dt><dd>The compiler refused the candidate with the message above, so the candidate was revised rather than defended.</dd><dt>evidence_refs</dt><dd class="mono">timeline.jsonl#E015, cases/rmsnorm_fp8/p2-5-agent-exploration.json</dd></dl></div></details><details class="event"><summary><span class="id">D009</span><span class="act">Make the agent&#x27;s placement acceptable to the compiler.</span> <span class="tag tag-rejected">REJECTED</span> <span class="tag tag-agent">AGENT_EXPERIMENT</span><p class="sum">P2-5 · 选中：Followed the tutorial&#x27;s checked modules and used one CTA with no explicit resharding for the checked variant.</p></summary><div class="body"><dl><dt>observations</dt><dd><ul><li>default_shard_layout: logical axis 0 size 2 is not divisible by mesh extent product 4 (role &#x27;layout&#x27;)</li></ul></dd><dt>candidate_actions</dt><dd><ul><li>Followed the tutorial&#x27;s checked modules and used one CTA with no explicit resharding for the checked variant.</li></ul></dd><dt>expected_effect</dt><dd>The 264-row thread mesh subdivides rows by PAIR*4=8, which does not divide 2.</dd><dt>observed_effect</dt><dd>The next attempt produced a different compiler message or was accepted.</dd><dt>reason</dt><dd>The compiler refused the candidate with the message above, so the candidate was revised rather than defended.</dd><dt>evidence_refs</dt><dd class="mono">timeline.jsonl#E016, cases/rmsnorm_fp8/p2-5-agent-exploration.json</dd></dl></div></details><details class="event"><summary><span class="id">D010</span><span class="act">Make the agent&#x27;s placement acceptable to the compiler.</span> <span class="tag tag-accepted">ACCEPTED</span> <span class="tag tag-agent">AGENT_EXPERIMENT</span><p class="sum">P2-5 · 选中：Declared the checked row count.</p></summary><div class="body"><dl><dt>observations</dt><dd><ul><li>evaluator: shape &#x27;[264, 56, 128]&#x27; is invalid for input of size 14336</li></ul></dd><dt>candidate_actions</dt><dd><ul><li>Declared the checked row count.</li></ul></dd><dt>expected_effect</dt><dd>The checked module declared 264 rows while x.pt carries 2.</dd><dt>observed_effect</dt><dd>The next attempt produced a different compiler message or was accepted.</dd><dt>reason</dt><dd>The compiler refused the candidate with the message above, so the candidate was revised rather than defended.</dd><dt>evidence_refs</dt><dd class="mono">timeline.jsonl#E017, cases/rmsnorm_fp8/p2-5-agent-exploration.json</dd></dl></div></details>
+
+<footer>
+生成自 <code>timeline.jsonl</code>（17 条事件）、<code>decisions.json</code>
+（10 条决策）与 <code>experiments.json</code>。
+页面为单个静态文件，不引用任何外部资源，可离线打开。
+标记：<span class="tag tag-replay">GUIDED_TUTORIAL_REPLAY</span> 为教程已给答案的复现；
+<span class="tag tag-agent">AGENT_EXPERIMENT</span> 为 Agent 自行提出并经验证的候选。
+</footer>
+</div>
+</body>
+</html>

@@ -1,0 +1,229 @@
+{
+  "schema": "tilefoundry-agent-decisions/v1",
+  "note": "Each decision records the candidates and the expected effect as they stood before the experiment ran, together with the effect that was then observed. Decisions D005 and after are the agent's own; D001-D004 replay the tutorial's guided steps and are marked as such by the stage they belong to.",
+  "decisions": [
+    {
+      "decision_id": "D001",
+      "task": "Make the RMSNorm + FP8 quantisation step match expected.pt.",
+      "stage": "P2-1",
+      "observations": [
+        "tilefoundry check reported output[0] equal mismatched 432 of 14336 elements and output[1] allclose max_violation 6.87445e-05",
+        "the failing HIR multiplied by gamma and then rounded to bf16"
+      ],
+      "evidence_refs": [
+        "timeline.jsonl#E002",
+        "results/experiments-20261026-110746-743687/experiments.json"
+      ],
+      "candidate_actions": [
+        "loosen the comparison tolerance so the check passes",
+        "reorder the arithmetic so the bf16 rounding happens before the gamma multiply"
+      ],
+      "selected_action": "reorder the arithmetic",
+      "expected_effect": "Both predicates pass at the stated tolerance without changing the tolerance, because the failure is a rounding-order error rather than numerical noise.",
+      "observed_effect": "equal mismatched 0 of 14336; allclose max_violation 0; exit status 0.",
+      "accepted": true,
+      "reason": "The tolerance was not touched. A rounding-order error shows up as exact fp8 mismatches in a small subset of elements, which is what the report showed (432 of 14336), so the repair had to be structural.",
+      "source_diff": "normed = tf.cast(rows * tf.rsqrt(mean + EPS) * tf.cast(gamma, \"f32\"), \"bf16\")\n->  normed = tf.cast(rows * tf.rsqrt(mean + EPS), \"bf16\") * gamma"
+    },
+    {
+      "decision_id": "D002",
+      "task": "Choose between the unfused and the fused placement.",
+      "stage": "P2-2",
+      "observations": [
+        "Naive ideal-ns=8697 bound-by=memory",
+        "Fused ideal-ns=3755 bound-by=memory",
+        "Naive gmem r7.23MiB/w5.47MiB@logical; Fused gmem r3.62MiB/w1.86MiB@logical"
+      ],
+      "evidence_refs": [
+        "timeline.jsonl#E005",
+        "timeline.jsonl#E006",
+        "timeline.jsonl#E007"
+      ],
+      "candidate_actions": [
+        "optimise the arithmetic, since the step is a reduction plus a quantisation",
+        "fuse the two functions so the normalized rows never reach gmem"
+      ],
+      "selected_action": "fuse",
+      "expected_effect": "gmem traffic drops by the round trip of the normalized rows, and the modelled time drops with it.",
+      "observed_effect": "gmem read and write each dropped 3784704 B (264x7168x2), and ideal-ns fell from 8697 to 3755.",
+      "accepted": true,
+      "reason": "Both placements report bound-by=memory, so arithmetic is not the lever. The traffic that disappeared is exactly the intermediate rows, which is the mechanism fusion was chosen for.",
+      "source_diff": "two @func entries (rms_norm, quantize) -> one @func with the intermediate kept on chip"
+    },
+    {
+      "decision_id": "D003",
+      "task": "Decide whether a runtime twin is needed before measuring.",
+      "stage": "P2-3",
+      "observations": [
+        "the HIR reports are a static cost model, not a measurement",
+        "the tutorial ships a hand-written Triton kernel that claims a speedup"
+      ],
+      "evidence_refs": [
+        "timeline.jsonl#E008"
+      ],
+      "candidate_actions": [
+        "compare the static ideal-ns figures directly against the torch baseline",
+        "build a Triton twin, check it against the same expected.pt, then time it"
+      ],
+      "selected_action": "build and check the twin, then time it",
+      "expected_effect": "The twin gives a measured counterpart to the static prediction, and checking it first keeps a broken kernel from producing a meaningless time.",
+      "observed_effect": "The twin passed both predicates on the H200 under Triton 3.5.1, so the timed kernel was correct.",
+      "accepted": true,
+      "reason": "ideal-ns counts bytes divided by bandwidth. It is not a duration, so it cannot be compared to a measured millisecond figure without inventing a conversion.",
+      "source_diff": ""
+    },
+    {
+      "decision_id": "D004",
+      "task": "Decide how to report the measured speedup.",
+      "stage": "P2-4",
+      "observations": [
+        "the torch baseline per-round median moved between 0.1078 ms and 0.210 ms across runs",
+        "that movement exceeds the 4.2x gap being described",
+        "timing one arm to completion before the other lets clock variation load onto one arm"
+      ],
+      "evidence_refs": [
+        "timeline.jsonl#E009",
+        "timeline.jsonl#E010"
+      ],
+      "candidate_actions": [
+        "report a single ratio from one pair of runs",
+        "interleave the arms per round and report the median of per-round medians with a range"
+      ],
+      "selected_action": "interleave the arms and report a range",
+      "expected_effect": "The reported ratio no longer depends on which arm ran while the device was warmer, and the spread shows how stable it is.",
+      "observed_effect": "5 alternating rounds gave a torch median of 0.1078 ms against a twin median of 0.02566 ms, a speedup of 4.09x to 4.23x with a median of 4.18x. An earlier run measured 4.44x to 4.58x, a median of 4.52x, so the range across sessions is wider than the range within one session.",
+      "accepted": true,
+      "reason": "A single ratio would have claimed more precision than the measurements support. The range is the honest summary and the session-to-session spread is stated separately.",
+      "source_diff": ""
+    },
+    {
+      "decision_id": "D005",
+      "task": "Find a placement that beats the fused placement.",
+      "stage": "P2-5",
+      "observations": [
+        "both tutorial placements are bound by memory",
+        "the fused placement already removed the intermediate gmem round trip",
+        "the fused placement still holds the activations in rmem for the whole func: rmem r70.57MiB/w56.07MiB@logical"
+      ],
+      "evidence_refs": [
+        "timeline.jsonl#E012",
+        "cases/rmsnorm_fp8/p2-5-agent-exploration.json"
+      ],
+      "candidate_actions": [
+        "shard the CTA axis first in a 4-D layout",
+        "keep the fused sharding but stage the activations through smem instead of rmem"
+      ],
+      "selected_action": "keep the fused sharding, move the activations from rmem to smem",
+      "expected_effect": "On-chip residency moves to a different memory level while gmem traffic and arithmetic stay the same. If on-chip residency were the limit, the modelled time would fall; if gmem were the limit, it would not move.",
+      "observed_effect": "ideal-ns stayed at 3755 with bound-by=memory. rmem fell to r16B/w0 and smem took the activations at r70.57MiB/w56.07MiB@logical.",
+      "accepted": false,
+      "reason": "The placement is correct, but it does not lower the modelled time. The hypothesis was that on-chip residency was a limit; the report shows it is not, because gmem is the bound. Recording this as an optimisation would be false.",
+      "source_diff": "held = tf.reshard(a, (ROWS @ (cta.tile, m.x), BLOCKS @ m.y, BLOCK @ m.t), \"rmem\")\n->  held = tf.reshard(a, (ROWS @ (cta.tile, m.x), BLOCKS @ m.y, BLOCK @ m.t), \"smem\")\n(and the same change for gamma, because a multi-input op needs one residency)"
+    },
+    {
+      "decision_id": "D006",
+      "task": "Make the agent's placement acceptable to the compiler.",
+      "stage": "P2-5",
+      "observations": [
+        "Binary: input 0 is laid out more coarsely and kept in rmem, which does not reach the units this runs on; reshard it to smem or gmem first"
+      ],
+      "evidence_refs": [
+        "timeline.jsonl#E013",
+        "cases/rmsnorm_fp8/p2-5-agent-exploration.json"
+      ],
+      "candidate_actions": [
+        "Followed Fused's 3-D sharding exactly instead of inventing a 4-D one."
+      ],
+      "selected_action": "Followed Fused's 3-D sharding exactly instead of inventing a 4-D one.",
+      "expected_effect": "A 4-D layout with the CTA axis first is more coarse than the units the multiply runs on.",
+      "observed_effect": "The next attempt produced a different compiler message or was accepted.",
+      "accepted": false,
+      "reason": "The compiler refused the candidate with the message above, so the candidate was revised rather than defended.",
+      "source_diff": ""
+    },
+    {
+      "decision_id": "D007",
+      "task": "Make the agent's placement acceptable to the compiler.",
+      "stage": "P2-5",
+      "observations": [
+        "Binary: operands have conflicting storage (rmem, smem); a multi-input op requires its concrete operands to share one residency"
+      ],
+      "evidence_refs": [
+        "timeline.jsonl#E014",
+        "cases/rmsnorm_fp8/p2-5-agent-exploration.json"
+      ],
+      "candidate_actions": [
+        "Moved both operands to smem."
+      ],
+      "selected_action": "Moved both operands to smem.",
+      "expected_effect": "Moving only `a` to smem is illegal while `gamma` stays in rmem.",
+      "observed_effect": "The next attempt produced a different compiler message or was accepted.",
+      "accepted": false,
+      "reason": "The compiler refused the candidate with the message above, so the candidate was revised rather than defended.",
+      "source_diff": ""
+    },
+    {
+      "decision_id": "D008",
+      "task": "Make the agent's placement acceptable to the compiler.",
+      "stage": "P2-5",
+      "observations": [
+        "Reshape cannot express the sharded layout: new shape does not align with the input layout factorization"
+      ],
+      "evidence_refs": [
+        "timeline.jsonl#E015",
+        "cases/rmsnorm_fp8/p2-5-agent-exploration.json"
+      ],
+      "candidate_actions": [
+        "Separated the analysis variant (264 rows, real split) from a checked variant at the 2-row shape the checking inputs carry."
+      ],
+      "selected_action": "Separated the analysis variant (264 rows, real split) from a checked variant at the 2-row shape the checking inputs carry.",
+      "expected_effect": "A smem-resident sharded value cannot be reshaped to (ROWS, BLOCKS, BLOCK) when the CTA axis carries no genuine split (1 CTA for a 2-row checked shape).",
+      "observed_effect": "The next attempt produced a different compiler message or was accepted.",
+      "accepted": false,
+      "reason": "The compiler refused the candidate with the message above, so the candidate was revised rather than defended.",
+      "source_diff": ""
+    },
+    {
+      "decision_id": "D009",
+      "task": "Make the agent's placement acceptable to the compiler.",
+      "stage": "P2-5",
+      "observations": [
+        "default_shard_layout: logical axis 0 size 2 is not divisible by mesh extent product 4 (role 'layout')"
+      ],
+      "evidence_refs": [
+        "timeline.jsonl#E016",
+        "cases/rmsnorm_fp8/p2-5-agent-exploration.json"
+      ],
+      "candidate_actions": [
+        "Followed the tutorial's checked modules and used one CTA with no explicit resharding for the checked variant."
+      ],
+      "selected_action": "Followed the tutorial's checked modules and used one CTA with no explicit resharding for the checked variant.",
+      "expected_effect": "The 264-row thread mesh subdivides rows by PAIR*4=8, which does not divide 2.",
+      "observed_effect": "The next attempt produced a different compiler message or was accepted.",
+      "accepted": false,
+      "reason": "The compiler refused the candidate with the message above, so the candidate was revised rather than defended.",
+      "source_diff": ""
+    },
+    {
+      "decision_id": "D010",
+      "task": "Make the agent's placement acceptable to the compiler.",
+      "stage": "P2-5",
+      "observations": [
+        "evaluator: shape '[264, 56, 128]' is invalid for input of size 14336"
+      ],
+      "evidence_refs": [
+        "timeline.jsonl#E017",
+        "cases/rmsnorm_fp8/p2-5-agent-exploration.json"
+      ],
+      "candidate_actions": [
+        "Declared the checked row count."
+      ],
+      "selected_action": "Declared the checked row count.",
+      "expected_effect": "The checked module declared 264 rows while x.pt carries 2.",
+      "observed_effect": "The next attempt produced a different compiler message or was accepted.",
+      "accepted": true,
+      "reason": "The compiler refused the candidate with the message above, so the candidate was revised rather than defended.",
+      "source_diff": ""
+    }
+  ]
+}
