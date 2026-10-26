@@ -1,0 +1,192 @@
+"""Contract tests for the container orchestration, runnable with no GPU.
+
+These tests import ``demo_container`` and drive it through a temporary
+TileFoundry-shaped tree with a stub test process, so they catch wiring errors —
+a misspelled helper, a wrong keyword, a stage that silently reports ``NOT_RUN``
+— before an H200 is ever allocated.
+
+Nothing here imports torch, tilefoundry, or Modal.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import demo_container  # noqa: E402
+import demo_report  # noqa: E402
+
+
+@pytest.fixture()
+def fake_source(tmp_path: Path) -> Path:
+    """A tree with the fixtures the demo points at, but no compiler behind them."""
+    root = tmp_path / "tilefoundry"
+    (root / "tests/nvidia/cuda/fixtures/cli/products").mkdir(parents=True)
+    (root / "tests/nvidia/cuda/fixtures/cli/products/h200_sxm.py").write_text("")
+    (root / "tests/nvidia/cuda/integration").mkdir(parents=True)
+    (root / "tests/nvidia/cuda/fixtures/tir").mkdir(parents=True)
+    (root / "tests/nvidia/cuda/fixtures/tir/square.py").write_text("")
+    return root
+
+
+def test_analysis_command_targets_the_shipped_hir_fixture(fake_source: Path, tmp_path: Path) -> None:
+    """The analysis stage runs the documented CLI form, from the source root."""
+    seen = {}
+
+    def fake_run(command, *, cwd, log, env=None):
+        seen["command"] = command
+        seen["cwd"] = cwd
+        Path(log).parent.mkdir(parents=True, exist_ok=True)
+        Path(log).write_text("stub\n")
+        return 0
+
+    original = demo_container._run_command
+    demo_container._run_command = fake_run
+    try:
+        demo_container.run_analysis(fake_source, tmp_path / "results", tmp_path / "logs")
+    finally:
+        demo_container._run_command = original
+
+    command = seen["command"]
+    assert command[1:4] == ["-m", "tilefoundry.cli", "analyze"]
+    assert command[4] == "tests/nvidia/cuda/fixtures/cli/products/h200_sxm.py:Model"
+    assert "--compute-cost" in command and "--memory" in command and "--json" in command
+    assert seen["cwd"] == fake_source
+
+
+def test_analysis_missing_report_is_recorded_not_raised(fake_source: Path, tmp_path: Path) -> None:
+    """A zero exit code with no report is evidence of a gap, not an exception."""
+    original = demo_container._run_command
+    demo_container._run_command = lambda *args, **kwargs: 0
+    try:
+        analysis = demo_container.run_analysis(fake_source, tmp_path / "results", tmp_path / "logs")
+    finally:
+        demo_container._run_command = original
+    assert analysis["json_ok"] is False
+    assert demo_report.evaluate_analysis(analysis)[0] != demo_report.STATUS_PASS
+
+
+def test_analysis_reads_back_the_executed_analyses(fake_source: Path, tmp_path: Path) -> None:
+    """The stage reports what the JSON says was executed, not what was requested."""
+    results = tmp_path / "results"
+    results.mkdir()
+
+    def fake_run(command, *, cwd, log, env=None):
+        Path(command[5]).write_text(
+            json.dumps(
+                {
+                    "target": "nvidia.h200_sxm",
+                    "module": "Model",
+                    "requested": ["compute-cost", "memory"],
+                    "executed": ["compute-cost", "memory"],
+                    "functions": [{"calls": [{"compute-cost": {}, "memory": {}}]}],
+                    "source": "annotated",
+                }
+            )
+        )
+        return 0
+
+    original = demo_container._run_command
+    demo_container._run_command = fake_run
+    try:
+        analysis = demo_container.run_analysis(fake_source, results, tmp_path / "logs")
+    finally:
+        demo_container._run_command = original
+    assert analysis["function_count"] == 1
+    assert analysis["call_count"] == 1
+    assert demo_report.evaluate_analysis(analysis)[0] == demo_report.STATUS_PASS
+
+
+def test_cmake_step_detection_needs_the_dumped_command(tmp_path: Path) -> None:
+    """A CMake step counts only when its dumped command file exists."""
+    build = tmp_path / "build"
+    build.mkdir()
+    assert demo_container._cmake_step_ran(build, "cmake-build") is False
+    (build / "cmake-build.cmd.txt").write_text("cmake --build")
+    assert demo_container._cmake_step_ran(build, "cmake-build") is True
+
+
+def test_dump_build_dir_follows_the_suite_dump_layout(tmp_path: Path) -> None:
+    """The build directory is derived from the dump root the suite really writes."""
+    nested = tmp_path / "generated" / "test_tir_control_flow" / "for_if_square_matches_torch" / "build"
+    nested.mkdir(parents=True)
+    assert demo_container._dump_build_dir(tmp_path / "generated") == nested
+
+
+def test_dump_build_dir_reports_a_missing_dump_instead_of_guessing(tmp_path: Path) -> None:
+    """An empty dump root yields a path that cannot contain evidence."""
+    derived = demo_container._dump_build_dir(tmp_path / "generated")
+    assert not derived.exists()
+    assert demo_container._cmake_step_ran(derived, "cmake-build") is False
+
+
+def test_run_reports_missing_stages_without_claiming_success(tmp_path: Path, monkeypatch) -> None:
+    """The orchestration path itself, with every external call stubbed out."""
+    source = tmp_path / "src"
+    source.mkdir()
+    volume = tmp_path / "volume"
+    volume.mkdir()
+    payload = {
+        "run_id": "test-run",
+        "snapshot": {
+            "commit": "0" * 40,
+            "branch": "main",
+            "dirty": False,
+            "dirty_entries": [],
+            "snapshot_digest": "d" * 64,
+            "snapshot_file_count": 1,
+            "cutlass_sha": "e406c186f510a15091cce01f782020ceb7ba8eb5",
+        },
+        "inventory": [],
+    }
+    monkeypatch.setenv("TILEFOUNDRY_DEMO_VOLUME", str(volume))
+
+    def fake_environment(source_root, log):
+        return {
+            "imports_ok": True,
+            "target_registered": True,
+            "tools_ok": True,
+            "cuda_available": True,
+            "gpu_name": "NVIDIA H200",
+            "compute_capability": [9, 0],
+            "python_version": "3.12.0",
+        }
+
+    def fake_analysis(source_root, results_dir, logs_dir):
+        return {
+            "returncode": 0,
+            "json_ok": True,
+            "executed": ["compute-cost", "memory"],
+            "target": "nvidia.h200_sxm",
+        }
+
+    def fake_test(source_root, results_dir, logs_dir, dump_root):
+        return {
+            "pytest": {"returncode": 0, "elapsed_seconds": 1.0, "junit": {"tests": 1, "skipped": 0}},
+            "compile": {"calls": [{"runtime_name": "M.host"}], "runtime_name": "M.host"},
+            "execution": {"runtime_calls": 1, "synchronize_calls": 1, "errors": []},
+            "correctness": {
+                "assert_close_calls": 1,
+                "comparisons": [{"rtol": 0, "atol": 0, "shapes_match": True}],
+                "errors": [],
+            },
+        }
+
+    monkeypatch.setattr(demo_container, "collect_environment", fake_environment)
+    monkeypatch.setattr(demo_container, "run_analysis", fake_analysis)
+    monkeypatch.setattr(demo_container, "run_test", fake_test)
+
+    manifest = demo_container._run(payload, source)
+    assert manifest["overall_status"] != "PASS"
+    assert manifest["analysis_status"] == "PASS"
+    assert manifest["compile_status"] != "PASS"
+    assert "artifacts_bundle" in manifest
+    archived = volume / manifest["artifacts_bundle"]["archive_path"]
+    assert archived.is_file()
+    assert manifest["artifacts_bundle"]["archive_sha256"] == demo_report.sha256_file(archived)
+    assert manifest["run_id"] == "test-run"

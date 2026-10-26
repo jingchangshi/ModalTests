@@ -1,0 +1,7 @@
+# .gitignore — generated evidence stays local, never committed.
+
+results/
+extracted/
+__pycache__/
+*.pyc
+.pytest_cache/
