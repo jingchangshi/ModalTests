@@ -36,6 +36,14 @@ if str(HERE) not in sys.path:
 from demo_report import download_command  # noqa: E402
 from demo_report import evaluate, resolve_run_id, reserve_directory, validate_run_id, write_json  # noqa: E402
 from demo_build_inputs import assert_dockerfile_unchanged, frozen_image_inputs  # noqa: E402
+from demo_task import (  # noqa: E402
+    TaskValidationError,
+    load_task,
+    runner_inventory,
+    runner_sha,
+    task_spec_sha,
+    validate_task,
+)
 
 DEFAULT_TILEFOUNDRY_REPO = Path(
     os.environ.get("TILEFOUNDRY_REPO", "/home/shijingchang/workspace/TileFoundry")
@@ -157,14 +165,55 @@ def _plain(value):
     return json.loads(json.dumps(value, default=str))
 
 
+TASKS_DIR = HERE / "tasks"
+DEFAULT_TASK = "tasks/square.json"
+
+
+def load_and_validate_task(task: str) -> dict:
+    """Resolve and validate one task spec, before any remote call.
+
+    Every structural, path, command and resource check happens here. A spec that fails is a
+    local error, so a rejected task costs no image build and no GPU.
+
+    Args:
+        task: The requested path, relative to the demo root.
+
+    Returns:
+        The effective spec.
+
+    Raises:
+        SystemExit: If the path leaves ``tasks/`` or the spec does not validate.
+    """
+    requested = Path(task)
+    if requested.is_absolute():
+        resolved = requested.resolve()
+    else:
+        resolved = (HERE / requested).resolve()
+    tasks_root = TASKS_DIR.resolve()
+    if not resolved.is_relative_to(tasks_root):
+        raise SystemExit(
+            f"task {task!r} resolves outside {tasks_root}; task specs live in tasks/"
+        )
+    try:
+        return validate_task(load_task(resolved))
+    except TaskValidationError as error:
+        raise SystemExit(f"task {task} is not acceptable: {error}") from None
+
+
 @app.local_entrypoint()
 def main(
     cpu_only: bool = False,
     run_id: str = "",
     tilefoundry_repo: str = str(DEFAULT_TILEFOUNDRY_REPO),
+    task: str = DEFAULT_TASK,
 ) -> None:
     """Freeze the local source, run the container stages, and report their evidence."""
     global STAGING, SNAPSHOT, SNAPSHOT_FILES
+    # Validate the task first: a rejected spec must cost nothing.
+    effective_task = load_and_validate_task(task)
+    needs_gpu = any(
+        stage["type"] in {"gpu_test", "gpu_benchmark"} for stage in effective_task["stages"]
+    )
     repo = Path(tilefoundry_repo)
     if not (repo / "pyproject.toml").is_file():
         raise SystemExit(f"not a TileFoundry checkout: {repo}")
@@ -197,6 +246,13 @@ def main(
         "inventory": SNAPSHOT_FILES,
         "build_inputs": SNAPSHOT.get("build_inputs"),
         "cpu_only": cpu_only,
+        # The effective spec, its digest, and the runner digest travel with the run so the
+        # evidence names what was requested and which whitelist ran it.
+        "task": effective_task,
+        "task_spec_sha": task_spec_sha(effective_task),
+        "runner_sha": runner_sha(),
+        "runner_inventory": runner_inventory(),
+        "completion_scope": "cpu_only" if cpu_only else "full",
     }
     print(
         f"source: {SNAPSHOT['commit'][:12]}"
@@ -223,7 +279,27 @@ def main(
         raise SystemExit("no-GPU preflight failed; no GPU was allocated")
 
     if cpu_only:
-        print("--cpu-only: stopping before the GPU stage")
+        # A CPU-only run proves the CPU stages and the archive. It cannot claim the task
+        # completed when the task needs a device.
+        scope = "NOT_RUN" if needs_gpu else "COMPLETE"
+        print(
+            json.dumps(
+                {
+                    "completion_scope": "cpu_only",
+                    "task_status": scope,
+                    "task_id": effective_task["task_id"],
+                    "task_spec_sha": payload["task_spec_sha"],
+                    "note": (
+                        "the requested task has GPU stages; no GPU was allocated and no "
+                        "GPU verdict is claimed"
+                        if needs_gpu
+                        else "the requested task is CPU-only and completed"
+                    ),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
         cleanup(SNAPSHOT)
         return
 

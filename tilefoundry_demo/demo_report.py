@@ -37,6 +37,9 @@ STATUS_PASS = "PASS"
 STATUS_FAIL = "FAIL"
 STATUS_ERROR = "ERROR"
 STATUS_BLOCKED = "BLOCKED"
+#: A stage that failed exactly as its task said it would, with the stated evidence.
+#: Distinct from PASS: it never claims the kernel worked.
+STATUS_EXPECTED_FAIL = "EXPECTED_FAIL_CONFIRMED"
 
 STAGE_FIELDS = (
     "environment_status",
@@ -55,12 +58,15 @@ SKIP_PARTS = frozenset(
     {"__pycache__", ".git", ".pytest_cache", "test_results", ".torch_extensions", "ccache"}
 )
 
+#: A confirmed intended failure is not a defect, so it ranks beside PASS rather than
+#: above it. It still cannot satisfy a stage whose task expected a pass.
 _SEVERITY = (
     (STATUS_ERROR, 4),
     (STATUS_FAIL, 3),
     (STATUS_BLOCKED, 2),
     (STATUS_NOT_RUN, 1),
     (STATUS_PASS, 0),
+    (STATUS_EXPECTED_FAIL, 0),
 )
 
 
@@ -518,3 +524,134 @@ def resolve_run_id(root: Path, candidate: str, *, attempts: int = 1000) -> str:
         if not (Path(root) / suffixed).exists():
             return suffixed
     raise RuntimeError(f"run id {candidate!r}: no free suffix after {attempts} attempts")
+
+
+def evaluate_stage(record: dict, expected: dict) -> tuple[str, str]:
+    """Judge one stage record against the outcome its task declared.
+
+    A task may say a stage is *supposed* to fail. That claim is dangerous, because it can
+    turn a real defect into a green tick, so it is confirmed only when every one of these
+    holds:
+
+    * the task declared ``negative: true`` and the outcome ``expected_fail``;
+    * the observed exit code is one of the declared ones (only 1 can confirm, by design);
+    * the process was not killed by a signal and did not time out;
+    * every declared diagnostic substring appears in the recorded log;
+    * the stage produced the structured evidence its type requires.
+
+    A stage that exits 0 while its task expected a failure did not demonstrate the negative
+    condition: that is ``FAIL``, not a pass. A positive stage that exits nonzero is ``FAIL``
+    however much its log resembles another task's diagnostic.
+
+    Args:
+        record: The stage record: ``exit_code``, ``signal``, ``timed_out``, ``log``,
+            ``stdout_tail``, ``stage_type``, and any structured evidence.
+        expected: The task's declared expectation for this stage.
+
+    Returns:
+        One ``(status, reason)`` pair.
+    """
+    if not isinstance(record, dict):
+        return STATUS_ERROR, "no stage record was produced"
+    if not isinstance(expected, dict):
+        return STATUS_ERROR, "the task declared no expectation for this stage"
+
+    exit_code = record.get("exit_code")
+    signal = record.get("signal")
+    timed_out = record.get("timed_out")
+    log = record.get("log")
+    if not isinstance(log, str):
+        log = ""
+
+    if timed_out is True:
+        return STATUS_ERROR, "the stage timed out; a timeout is never a confirmed failure"
+    if signal is not None:
+        return STATUS_ERROR, f"the stage was killed by signal {signal}, which is not a verdict"
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        return STATUS_ERROR, "the stage recorded no usable exit code"
+
+    negative = expected.get("negative") is True
+    if not negative:
+        if exit_code != 0:
+            return STATUS_FAIL, f"the stage exited {exit_code}, and the task expected a pass"
+        return STATUS_PASS, "the stage exited 0 as the task expected"
+
+    # From here the task claims this stage is supposed to fail.
+    if expected.get("outcome") != "expected_fail":
+        return STATUS_FAIL, (
+            f"the stage is marked negative but declares outcome {expected.get('outcome')!r}"
+        )
+    allowed = expected.get("exit_codes")
+    if not isinstance(allowed, list) or not allowed:
+        return STATUS_FAIL, "the stage is marked negative but declares no acceptable exit code"
+    if exit_code == 0:
+        return STATUS_FAIL, (
+            "the stage was expected to fail but exited 0, so the negative condition was never "
+            "demonstrated"
+        )
+    if exit_code not in allowed:
+        return STATUS_FAIL, f"the stage exited {exit_code}, which is not one of {allowed}"
+
+    substrings = expected.get("diagnostic_substrings")
+    if not isinstance(substrings, list) or not substrings:
+        return STATUS_FAIL, "the stage is marked negative but declares no diagnostic substring"
+    missing = [text for text in substrings if text not in log]
+    if missing:
+        return STATUS_FAIL, (
+            f"the failure does not carry the declared diagnostic {missing[0]!r}, so it is not "
+            "the intended failure"
+        )
+
+    evidence_status, evidence_reason = _evaluate_negative_evidence(record, substrings)
+    if evidence_status != STATUS_PASS:
+        return evidence_status, evidence_reason
+
+    return STATUS_EXPECTED_FAIL, (
+        f"failed as declared: exit {exit_code} with {evidence_reason}"
+    )
+
+
+def _evaluate_negative_evidence(record: dict, substrings: list[str]) -> tuple[str, str]:
+    """Require the structured evidence an intended failure must leave behind.
+
+    The log substring alone is weak evidence: a crashed import can print a matching word.
+    Each negative-capable stage type must show the failure in its own report, so a confirmed
+    negative is a claim about behaviour rather than about text.
+    """
+    stage_type = record.get("stage_type")
+    if stage_type == "hir_check":
+        report = record.get("check_report")
+        if not isinstance(report, dict):
+            return STATUS_ERROR, "the check stage recorded no parsed report"
+        comparisons = report.get("comparisons")
+        if not isinstance(comparisons, list) or not comparisons:
+            return STATUS_ERROR, "the check report holds no comparisons"
+        failed = [item for item in comparisons if item.get("outcome") not in {None, "passed"}]
+        if not failed:
+            return STATUS_FAIL, "the check report shows no failed predicate, so nothing was demonstrated"
+        return STATUS_PASS, f"{len(failed)} predicate(s) failed in the report"
+
+    if stage_type == "hir_analyze":
+        report = record.get("analysis_report")
+        if not isinstance(report, dict):
+            return STATUS_ERROR, "the analyze stage recorded no parsed report"
+        return STATUS_PASS, "the analysis report was parsed"
+
+    if stage_type == "gpu_test":
+        junit = record.get("junit")
+        if not isinstance(junit, dict):
+            return STATUS_ERROR, "the test stage recorded no JUnit summary"
+        cases = junit.get("cases") or []
+        failed_cases = [
+            case
+            for case in cases
+            if case.get("outcome") == "failed" and case.get("phase", "call") == "call"
+        ]
+        if not failed_cases:
+            return STATUS_FAIL, (
+                "no test case failed in its call phase; a setup or collection error is not "
+                "the intended negative condition"
+            )
+        return STATUS_PASS, "the registered case failed in its call phase"
+
+    return STATUS_ERROR, f"a {stage_type!r} stage cannot confirm an intended failure"

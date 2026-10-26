@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "task_id": "square_cpu",
+  "description": "Analyze the registered H200 HIR fixture and check it on CPU, without allocating a GPU.",
+  "source_snapshot": {"mode": "local", "expected_sha256": null},
+  "target": "nvidia.h200_sxm",
+  "gpu": {"type": "H200", "count": 0},
+  "stages": [
+    {"stage_id": "environment", "type": "environment", "params": {}},
+    {
+      "stage_id": "analyze",
+      "type": "hir_analyze",
+      "params": {
+        "source_id": "square_hir",
+        "analyses": ["compute-cost", "memory"],
+        "dims": {}
+      }
+    },
+    {
+      "stage_id": "check",
+      "type": "hir_check",
+      "params": {
+        "source_id": "square_hir",
+        "input_ids": [],
+        "comparisons": [
+          {"out": "output", "predicates": [{"fn": "allclose", "bounds": {"atol": 0, "rtol": 0}}]}
+        ],
+        "dims": {}
+      }
+    },
+    {"stage_id": "archive", "type": "archive", "params": {}}
+  ],
+  "inputs": [],
+  "expected_outcomes": {
+    "environment": {"outcome": "pass", "negative": false},
+    "analyze": {"outcome": "pass", "negative": false},
+    "check": {"outcome": "pass", "negative": false},
+    "archive": {"outcome": "pass", "negative": false}
+  },
+  "artifacts": {"include": ["logs", "results", "generated"], "required": []},
+  "limits": {
+    "cpu_seconds": 1800,
+    "gpu_seconds": 600,
+    "stage_seconds": 300,
+    "max_input_bytes": 16777216,
+    "max_artifact_bytes": 1073741824,
+    "max_stages": 16
+  }
+}

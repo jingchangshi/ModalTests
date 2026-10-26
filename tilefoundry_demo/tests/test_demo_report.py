@@ -628,3 +628,128 @@ def test_a_schema_one_manifest_with_drift_still_fails() -> None:
     status, reason = demo_report.evaluate_environment(legacy, 0)
     assert status == demo_report.STATUS_FAIL
     assert "post_execution" in reason
+
+
+# ---------------------------------------------------------------------------
+# P1: an intended failure is confirmed only on complete, specific evidence.
+# ---------------------------------------------------------------------------
+
+EXPECTED = {
+    "outcome": "expected_fail",
+    "negative": True,
+    "exit_codes": [1],
+    "diagnostic_substrings": ["unsupported dtype"],
+}
+
+
+def _check_record(**overrides) -> dict:
+    """A stage record that confirms a declared check failure."""
+    record = {
+        "stage_type": "hir_check",
+        "exit_code": 1,
+        "signal": None,
+        "timed_out": False,
+        "log": "Error: unsupported dtype for the requested comparison\n",
+        "check_report": {
+            "comparisons": [{"out": "output[0]", "outcome": "failed", "predicate": "equal"}]
+        },
+    }
+    record.update(overrides)
+    return record
+
+
+def test_expected_fail_is_confirmed_on_complete_evidence() -> None:
+    """The one state that earns EXPECTED_FAIL_CONFIRMED."""
+    status, reason = demo_report.evaluate_stage(_check_record(), EXPECTED)
+    assert status == demo_report.STATUS_EXPECTED_FAIL
+    assert "failed as declared" in reason
+
+
+@pytest.mark.parametrize(
+    "overrides, expected_status, message",
+    [
+        # Exiting 0 means the negative condition never happened.
+        ({"exit_code": 0}, demo_report.STATUS_FAIL, "exited 0"),
+        # A usage error is not a verdict on the kernel.
+        ({"exit_code": 2}, demo_report.STATUS_FAIL, "not one of"),
+        # A signal is not a verdict either.
+        ({"signal": 11}, demo_report.STATUS_ERROR, "killed by signal"),
+        # A timeout is an error, never a confirmed failure.
+        ({"timed_out": True}, demo_report.STATUS_ERROR, "timed out"),
+        # Exit 1 for the wrong reason is still not the intended failure.
+        (
+            {"log": "ImportError: missing torch\n"},
+            demo_report.STATUS_FAIL,
+            "does not carry the declared diagnostic",
+        ),
+        # Matching text but no report is unverifiable.
+        ({"check_report": None}, demo_report.STATUS_ERROR, "no parsed report"),
+        # A report showing nothing failed demonstrates nothing.
+        (
+            {"check_report": {"comparisons": [{"out": "output[0]", "outcome": "passed"}]}},
+            demo_report.STATUS_FAIL,
+            "no failed predicate",
+        ),
+    ],
+)
+def test_expected_fail_is_not_confirmed_without_full_evidence(
+    overrides: dict, expected_status: str, message: str
+) -> None:
+    """Every way an intended failure can fail to be demonstrated."""
+    status, reason = demo_report.evaluate_stage(_check_record(**overrides), EXPECTED)
+    assert status == expected_status
+    assert message in reason
+
+
+def test_a_positive_stage_exiting_one_is_a_failure() -> None:
+    """A task expected to pass does not become a pass because its log looks familiar."""
+    record = _check_record(log="Error: unsupported dtype for the requested comparison\n")
+    status, reason = demo_report.evaluate_stage(record, {"outcome": "pass", "negative": False})
+    assert status == demo_report.STATUS_FAIL
+    assert "expected a pass" in reason
+
+
+def test_a_negative_stage_without_the_declared_outcome_is_refused() -> None:
+    """`negative: true` alone is not enough; the outcome must say expected_fail."""
+    status, reason = demo_report.evaluate_stage(
+        _check_record(), {"outcome": "pass", "negative": True}
+    )
+    assert status == demo_report.STATUS_FAIL
+    assert "declares outcome" in reason
+
+
+def test_a_negative_pytest_stage_requires_a_call_phase_failure() -> None:
+    """A setup or collection error is not the intended negative condition."""
+    record = _check_record(
+        stage_type="gpu_test",
+        check_report=None,
+        junit={"cases": [{"name": "test_x", "outcome": "failed", "phase": "setup"}]},
+    )
+    status, reason = demo_report.evaluate_stage(record, EXPECTED)
+    assert status == demo_report.STATUS_FAIL
+    assert "call phase" in reason
+
+    record["junit"] = {"cases": [{"name": "test_x", "outcome": "failed", "phase": "call"}]}
+    status, reason = demo_report.evaluate_stage(record, EXPECTED)
+    assert status == demo_report.STATUS_EXPECTED_FAIL
+
+
+def test_a_confirmed_negative_does_not_claim_the_kernel_worked() -> None:
+    """The status vocabulary itself must not let a failure be read as a success."""
+    assert demo_report.STATUS_EXPECTED_FAIL != demo_report.STATUS_PASS
+    assert "FAIL" in demo_report.STATUS_EXPECTED_FAIL
+
+
+def test_a_missing_stage_record_is_an_error_not_a_pass() -> None:
+    """Absent evidence cannot satisfy either a positive or a negative expectation."""
+    status, reason = demo_report.evaluate_stage(None, {"outcome": "pass", "negative": False})
+    assert status == demo_report.STATUS_ERROR
+    assert "no stage record" in reason
+
+
+def test_a_negative_gpu_benchmark_cannot_be_confirmed() -> None:
+    """Timing is not behaviour, so a benchmark cannot demonstrate an intended failure."""
+    record = _check_record(stage_type="gpu_benchmark", check_report=None)
+    status, reason = demo_report.evaluate_stage(record, EXPECTED)
+    assert status == demo_report.STATUS_ERROR
+    assert "cannot confirm" in reason
