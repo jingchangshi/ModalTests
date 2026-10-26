@@ -13,10 +13,10 @@ Covered:
 
 | Stage | Evidence it produces |
 |---|---|
-| environment | Image installs the uploaded snapshot; both distributions resolve inside it; `nvidia.h200_sxm` is registered; nvcc/CMake/ninja/g++ present |
+| environment | Image installs the uploaded snapshot; both distributions resolve inside it as editable installs, neither came from an index, the installed tree still matches the digested inventory, and nvcc/CMake/ninja/g++ are present |
 | gpu | `torch.cuda.get_device_properties` reports an H200 at compute capability 9.0 |
 | analysis | `tilefoundry analyze` exits 0 and writes JSON naming `compute-cost` and `memory` |
-| compile | One `tilefoundry.compile` call returns `TirSquare.square_host`; CUDA source, CMake logs, and the built `.so` are captured |
+| compile | One `tilefoundry.compile` call returns `TirSquare.square_host`; CUDA source, clean CMake configure/build logs, the built `.so`, and the `sm_90` codegen flag are captured |
 | execution | The compiled runtime is called and the device synchronized |
 | correctness | The upstream test's own `torch.testing.assert_close` comparison passed |
 | pytest | Exactly one test ran and passed, exit code 0 |
@@ -156,12 +156,14 @@ tilefoundry-demo-<run-id>/
 
 ## 8 · Cost control
 
-- The Dockerfile and pip layers are cached; only the source layer changes when a
-  `.py` file changes.
+- The Dockerfile and pip layers are cached. A `.py` change rebuilds only the
+  source layer plus the two cheap commands after it (`pip install -e` and an
+  import check), not the CUDA/Torch layers.
 - Preflight is a CPU function: a broken image costs no GPU time.
-- One GPU function per command, `timeout=1800`, no retries, no concurrency.
-- A typical passing run is under a minute of H200 time (observed ~52 s of
-  container work, ~38 s of it in pytest).
+- One GPU function per command, `timeout=600` (the task's first-round ceiling),
+  no retries, no concurrency.
+- A typical passing run is under a minute of H200 time (observed ~40 s of
+  container work, ~34 s of it in pytest).
 - Image builds, CPU time, and Volume storage are billed separately from GPU time.
 
 ## 9 · Local tests (no GPU, no torch)
@@ -171,7 +173,7 @@ cd /home/shijingchang/workspace/modal/tilefoundry_demo
 python -m pytest tests -q
 ```
 
-73 tests cover the evidence reducer, the inventory/snapshot rules, the plugin's
+84 tests cover the evidence reducer, the inventory/snapshot rules, the plugin's
 build capture, the orchestration path with stubbed stages, and the bundle
 verifier. They assert one property repeatedly: **no missing, partial, skipped,
 or contradictory observation can be reported as `PASS`.**
@@ -187,3 +189,20 @@ after installation.
 The package version is `0.0.0+demo.<digest prefix>`: derived from the snapshot,
 never from the current date, so the same tree always installs the same version
 and two different trees never collide.
+
+## 11 · What a `PASS` cannot survive
+
+Each of these was checked by a local test, so the claim is executable rather
+than asserted:
+
+- a skipped or `xfail`ed test, or a JUnit report with two cases;
+- a `torch.testing.assert_close` that did not run, or one with non-zero tolerance;
+- a compile stage with no CUDA source, unclean CMake logs, no library, or a
+  library with no digest or the wrong name;
+- codegen for an architecture other than `sm_90`, or no recorded architecture;
+- a device that is not an H200 at compute capability 9.0;
+- a package that resolves outside the uploaded tree, was installed from an
+  index, or sits in a tree that drifted from the digested inventory;
+- core and target versions that differ;
+- an archive that never reached the Volume, or whose digest does not match the
+  printed value.

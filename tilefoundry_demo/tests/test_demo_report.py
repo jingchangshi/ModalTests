@@ -30,6 +30,22 @@ PASSING_ENVIRONMENT = {
     "cuda_available": True,
     "gpu_name": "NVIDIA H200",
     "compute_capability": [9, 0],
+    "tilefoundry_version": "0.0.0+demo.47a6ed6a7dc8",
+    "tilefoundry_nvidia_version": "0.0.0+demo.47a6ed6a7dc8",
+    "tilefoundry_origin": "/opt/tilefoundry/src/tilefoundry/__init__.py",
+    "tilefoundry_nvidia_origin": "/opt/tilefoundry/targets/nvidia/tilefoundry_nvidia/__init__.py",
+    "origin_inside_snapshot": True,
+    "installations": {
+        "tilefoundry": {"url": "file:///opt/tilefoundry", "dir_info": {"editable": True}},
+        "tilefoundry-nvidia": {
+            "url": "file:///opt/tilefoundry/targets/nvidia",
+            "dir_info": {"editable": True},
+        },
+    },
+    "source_check": {
+        "before_install": {"missing": [], "unexpected": [], "modified": []},
+        "after_install": {"missing": [], "unexpected": [], "modified": []},
+    },
 }
 
 PASSING_EVIDENCE = {
@@ -49,6 +65,7 @@ PASSING_EVIDENCE = {
         "cmake_configured": True,
         "cmake_built": True,
         "libraries": [{"path": "generated/libTirSquare.so", "size": 10, "sha256": "ab"}],
+        "target_arch": "sm_90",
     },
     "execution": {"runtime_calls": 1, "synchronize_calls": 1, "errors": []},
     "correctness": {
@@ -102,6 +119,50 @@ def test_complete_evidence_is_pass() -> None:
         ("build tools missing", {"environment": {**PASSING_ENVIRONMENT, "tools_ok": False}}),
         ("no cuda device", {"environment": {**PASSING_ENVIRONMENT, "cuda_available": False}}),
         ("wrong device", {"environment": {**PASSING_ENVIRONMENT, "gpu_name": "NVIDIA A10G"}}),
+        (
+            "package from an index",
+            {"environment": {**PASSING_ENVIRONMENT, "origin_inside_snapshot": False}},
+        ),
+        (
+            "non-editable install",
+            {
+                "environment": {
+                    **PASSING_ENVIRONMENT,
+                    "installations": {
+                        "tilefoundry": {"url": "https://pypi.org/simple/tilefoundry"},
+                        "tilefoundry-nvidia": {"url": "file:///opt/tilefoundry/targets/nvidia", "dir_info": {"editable": True}},
+                    },
+                }
+            },
+        ),
+        (
+            "tree drifted before install",
+            {
+                "environment": {
+                    **PASSING_ENVIRONMENT,
+                    "source_check": {
+                        "before_install": {"missing": ["src/tilefoundry/x.py"], "unexpected": [], "modified": []},
+                        "after_install": {"missing": [], "unexpected": [], "modified": []},
+                    },
+                }
+            },
+        ),
+        (
+            "tree drifted after install",
+            {
+                "environment": {
+                    **PASSING_ENVIRONMENT,
+                    "source_check": {
+                        "before_install": {"missing": [], "unexpected": [], "modified": []},
+                        "after_install": {"missing": [], "unexpected": [], "modified": ["src/tilefoundry/y.py"]},
+                    },
+                }
+            },
+        ),
+        (
+            "core and target versions differ",
+            {"environment": {**PASSING_ENVIRONMENT, "tilefoundry_nvidia_version": "0.0.3"}},
+        ),
         (
             "wrong capability",
             {"environment": {**PASSING_ENVIRONMENT, "compute_capability": [8, 6]}},
@@ -501,3 +562,31 @@ def test_a_failed_run_stays_failed_even_with_a_good_archive() -> None:
     )
     combined = demo_report.combine_with_archive(_statuses(failed), GOOD_ARCHIVE)
     assert combined["overall_status"] == "FAIL"
+
+
+@pytest.mark.parametrize(
+    ("name", "overrides"),
+    [
+        ("wrong arch", {"target_arch": "sm_86"}),
+        ("unknown arch", {"target_arch": None}),
+        ("no library digest", {"libraries": [{"path": "generated/libTirSquare.so", "size": 10}]}),
+    ],
+)
+def test_compile_arch_and_digest_are_gated(name: str, overrides: dict) -> None:
+    """A library built for another architecture, or one with no digest, fails."""
+    verdict = _statuses(_with(compile={**PASSING_EVIDENCE["compile"], **overrides}))
+    assert verdict["compile_status"] != "PASS"
+    assert verdict["overall_status"] != "PASS", name
+
+
+def test_the_recorded_arch_is_reported_when_it_matches() -> None:
+    """sm_90 for the H200 target passes and is stated in the reason."""
+    status, _ = demo_report.evaluate_compile(PASSING_EVIDENCE["compile"])
+    assert status == "PASS"
+
+
+def test_source_integrity_reason_names_the_evidence() -> None:
+    """A passing environment states what makes it the uploaded tree."""
+    status, reason = demo_report.evaluate_environment(PASSING_ENVIRONMENT, 0)
+    assert status == "PASS"
+    assert "snapshot" in reason and "inventory" in reason

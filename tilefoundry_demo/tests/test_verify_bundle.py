@@ -32,6 +32,22 @@ EVIDENCE = {
         "python_version": "3.12.15",
         "torch_version": "2.9.1+cu128",
         "torch_cuda_version": "12.8",
+        "tilefoundry_version": "0.0.0+demo.dddd",
+        "tilefoundry_nvidia_version": "0.0.0+demo.dddd",
+        "tilefoundry_origin": "/opt/tilefoundry/src/tilefoundry/__init__.py",
+        "tilefoundry_nvidia_origin": "/opt/tilefoundry/targets/nvidia/tilefoundry_nvidia/__init__.py",
+        "origin_inside_snapshot": True,
+        "installations": {
+            "tilefoundry": {"url": "file:///opt/tilefoundry", "dir_info": {"editable": True}},
+            "tilefoundry-nvidia": {
+                "url": "file:///opt/tilefoundry/targets/nvidia",
+                "dir_info": {"editable": True},
+            },
+        },
+        "source_check": {
+            "before_install": {"missing": [], "unexpected": [], "modified": []},
+            "after_install": {"missing": [], "unexpected": [], "modified": []},
+        },
     },
     "analysis": {"returncode": 0, "json_ok": True, "executed": ["compute-cost", "memory"], "target": "nvidia.h200_sxm"},
     "compile": {
@@ -42,6 +58,7 @@ EVIDENCE = {
         "cmake_configured": True,
         "cmake_built": True,
         "libraries": [{"path": "generated/build/build/libTirSquare.so", "size": 3, "sha256": "aa"}],
+        "target_arch": "sm_90",
     },
     "execution": {"runtime_calls": 1, "synchronize_calls": 1, "errors": []},
     "correctness": {

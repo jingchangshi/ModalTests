@@ -41,7 +41,7 @@ DEFAULT_TILEFOUNDRY_REPO = Path(
 )
 VOLUME_NAME = "tilefoundry-artifacts"
 SOURCE_ROOT = "/opt/tilefoundry"
-GPU_TIMEOUT_SECONDS = 1800
+GPU_TIMEOUT_SECONDS = 600
 CPU_TIMEOUT_SECONDS = 1800
 GPU_SPEC = "H200"
 
@@ -61,7 +61,7 @@ app = modal.App("tilefoundry-h200-demo")
 artifacts = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 
 if modal.is_local():
-    from demo_source import prepare
+    from demo_source import cleanup, prepare
 
     STAGING, SNAPSHOT, SNAPSHOT_FILES = prepare(DEFAULT_TILEFOUNDRY_REPO)
     SNAPSHOT["package_version"] = package_version(SNAPSHOT)
@@ -181,7 +181,11 @@ def main(
     )
     print(f"run_id: {run_id}")
 
-    environment = preflight.remote(payload)
+    try:
+        environment = preflight.remote(payload)
+    except BaseException:
+        cleanup(SNAPSHOT)
+        raise
     print(json.dumps(environment, indent=2, sort_keys=True))
     verdict = evaluate(
         {"environment": environment, "preflight_returncode": environment.get("preflight_returncode")}
@@ -189,13 +193,18 @@ def main(
     write_json(HERE / "results" / run_id / "preflight.json", environment)
     if verdict["environment_status"] != "PASS":
         print(json.dumps(verdict["stages"]["environment"], indent=2, sort_keys=True))
+        cleanup(SNAPSHOT)
         raise SystemExit("no-GPU preflight failed; no GPU was allocated")
 
     if cpu_only:
         print("--cpu-only: stopping before the GPU stage")
+        cleanup(SNAPSHOT)
         return
 
-    result = run_on_h200.remote(payload)
+    try:
+        result = run_on_h200.remote(payload)
+    finally:
+        cleanup(SNAPSHOT)
     write_json(HERE / "results" / run_id / "remote-result.json", result)
     print(json.dumps(result, indent=2, sort_keys=True))
     print("\nDownload the full evidence bundle:")

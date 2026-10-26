@@ -102,13 +102,17 @@ def test_analysis_reads_back_the_executed_analyses(fake_source: Path, tmp_path: 
     assert demo_report.evaluate_analysis(analysis)[0] == demo_report.STATUS_PASS
 
 
-def test_cmake_step_detection_needs_the_dumped_command(tmp_path: Path) -> None:
-    """A CMake step counts only when its dumped command file exists."""
+def test_cmake_step_needs_a_command_and_a_clean_stderr(tmp_path: Path) -> None:
+    """The dumped command proves the attempt; the dumped stderr proves the outcome."""
     build = tmp_path / "build"
     build.mkdir()
-    assert demo_container._cmake_step_ran(build, "cmake-build") is False
+    assert demo_container._cmake_step_succeeded(build, "cmake-build") is False
     (build / "cmake-build.cmd.txt").write_text("cmake --build")
-    assert demo_container._cmake_step_ran(build, "cmake-build") is True
+    assert demo_container._cmake_step_succeeded(build, "cmake-build") is False
+    (build / "cmake-build.stderr").write_text("")
+    assert demo_container._cmake_step_succeeded(build, "cmake-build") is True
+    (build / "cmake-build.stderr").write_text("error: nvcc failed")
+    assert demo_container._cmake_step_succeeded(build, "cmake-build") is False
 
 
 def test_dump_build_dir_follows_the_suite_dump_layout(tmp_path: Path) -> None:
@@ -122,13 +126,14 @@ def test_dump_build_dir_reports_a_missing_dump_instead_of_guessing(tmp_path: Pat
     """An empty dump root yields a path that cannot contain evidence."""
     derived = demo_container._dump_build_dir(tmp_path / "generated")
     assert not derived.exists()
-    assert demo_container._cmake_step_ran(derived, "cmake-build") is False
+    assert demo_container._cmake_step_succeeded(derived, "cmake-build") is False
 
 
 def test_run_reports_missing_stages_without_claiming_success(tmp_path: Path, monkeypatch) -> None:
     """The orchestration path itself, with every external call stubbed out."""
     source = tmp_path / "src"
     source.mkdir()
+    (source / "pyproject.toml").write_text("[project]\nname = 'x'\n")
     volume = tmp_path / "volume"
     volume.mkdir()
     payload = {
@@ -142,7 +147,7 @@ def test_run_reports_missing_stages_without_claiming_success(tmp_path: Path, mon
             "snapshot_file_count": 1,
             "cutlass_sha": "e406c186f510a15091cce01f782020ceb7ba8eb5",
         },
-        "inventory": [],
+        "inventory": [{"path": "pyproject.toml", "size": 23, "sha256": demo_report.sha256_file(source / "pyproject.toml")}],
     }
     monkeypatch.setenv("TILEFOUNDRY_DEMO_VOLUME", str(volume))
 
@@ -155,6 +160,18 @@ def test_run_reports_missing_stages_without_claiming_success(tmp_path: Path, mon
             "gpu_name": "NVIDIA H200",
             "compute_capability": [9, 0],
             "python_version": "3.12.0",
+            "tilefoundry_version": "0.0.0+demo.dddd",
+            "tilefoundry_nvidia_version": "0.0.0+demo.dddd",
+            "tilefoundry_origin": "/opt/tilefoundry/src/tilefoundry/__init__.py",
+            "tilefoundry_nvidia_origin": "/opt/tilefoundry/targets/nvidia/tilefoundry_nvidia/__init__.py",
+            "origin_inside_snapshot": True,
+            "installations": {
+                "tilefoundry": {"url": "file:///opt/tilefoundry", "dir_info": {"editable": True}},
+                "tilefoundry-nvidia": {
+                    "url": "file:///opt/tilefoundry/targets/nvidia",
+                    "dir_info": {"editable": True},
+                },
+            },
         }
 
     def fake_analysis(source_root, results_dir, logs_dir):
@@ -167,8 +184,20 @@ def test_run_reports_missing_stages_without_claiming_success(tmp_path: Path, mon
 
     def fake_test(source_root, results_dir, logs_dir, dump_root):
         return {
-            "pytest": {"returncode": 0, "elapsed_seconds": 1.0, "junit": {"tests": 1, "skipped": 0}},
-            "compile": {"calls": [{"runtime_name": "M.host"}], "runtime_name": "M.host"},
+            "pytest": {
+                "returncode": 0,
+                "elapsed_seconds": 1.0,
+                "junit": {"tests": 1, "failures": 0, "errors": 0, "skipped": 0},
+            },
+            "compile": {
+                "calls": [{"runtime_name": "M.host"}],
+                "runtime_name": "M.host",
+                "cu_files": ["module.device_0.cu"],
+                "cmake_configured": True,
+                "cmake_built": True,
+                "target_arch": "sm_90",
+                "libraries": [{"path": "generated/libM.so", "size": 1, "sha256": "ab"}],
+            },
             "execution": {"runtime_calls": 1, "synchronize_calls": 1, "errors": []},
             "correctness": {
                 "assert_close_calls": 1,
@@ -182,11 +211,86 @@ def test_run_reports_missing_stages_without_claiming_success(tmp_path: Path, mon
     monkeypatch.setattr(demo_container, "run_test", fake_test)
 
     manifest = demo_container._run(payload, source)
-    assert manifest["overall_status"] != "PASS"
+    # The GPU path must attach the inventory comparison itself; the environment
+    # observer does not produce it, so a passing source-integrity gate here
+    # proves the attachment, not the stub.
+    assert manifest["evidence"]["environment"]["source_check"]["before_install"] == {
+        "missing": [],
+        "unexpected": [],
+        "modified": [],
+    }
+    assert manifest["environment_status"] == "PASS"
     assert manifest["analysis_status"] == "PASS"
-    assert manifest["compile_status"] != "PASS"
+    assert manifest["compile_status"] == "PASS"
+    assert manifest["execution_status"] == "PASS"
+    assert manifest["correctness_status"] == "PASS"
+    assert manifest["overall_status"] == "PASS", manifest["overall_reason"]
     assert "artifacts_bundle" in manifest
     archived = volume / manifest["artifacts_bundle"]["archive_path"]
     assert archived.is_file()
     assert manifest["artifacts_bundle"]["archive_sha256"] == demo_report.sha256_file(archived)
     assert manifest["run_id"] == "test-run"
+
+
+def test_run_fails_when_the_installed_tree_lost_a_selected_file(tmp_path: Path, monkeypatch) -> None:
+    """A tree that does not match the digested inventory is not a passing run."""
+    source = tmp_path / "src"
+    source.mkdir()
+    volume = tmp_path / "volume"
+    volume.mkdir()
+    payload = {
+        "run_id": "drift-run",
+        "snapshot": {
+            "commit": "0" * 40,
+            "branch": "main",
+            "dirty": False,
+            "dirty_entries": [],
+            "snapshot_digest": "d" * 64,
+            "snapshot_file_count": 1,
+            "cutlass_sha": "e406c186f510a15091cce01f782020ceb7ba8eb5",
+        },
+        "inventory": [{"path": "src/missing.py", "size": 1, "sha256": "aa"}],
+    }
+    monkeypatch.setenv("TILEFOUNDRY_DEMO_VOLUME", str(volume))
+    monkeypatch.setattr(
+        demo_container,
+        "collect_environment",
+        lambda source_root, log: {
+            "imports_ok": True,
+            "target_registered": True,
+            "tools_ok": True,
+            "origin_inside_snapshot": True,
+            "installations": {
+                "tilefoundry": {"dir_info": {"editable": True}},
+                "tilefoundry-nvidia": {"dir_info": {"editable": True}},
+            },
+            "tilefoundry_version": "0.0.0+demo.dddd",
+            "tilefoundry_nvidia_version": "0.0.0+demo.dddd",
+        },
+    )
+    monkeypatch.setattr(demo_container, "run_analysis", lambda *args: {})
+    monkeypatch.setattr(demo_container, "run_test", lambda *args: {})
+
+    manifest = demo_container._run(payload, source)
+    assert manifest["environment_status"] == "FAIL"
+    assert "missing" in manifest["overall_reason"]
+    assert manifest["overall_status"] != "PASS"
+
+
+def test_compiled_arch_reads_the_nvcc_flag_as_cmake_quotes_it(tmp_path: Path) -> None:
+    """The real dump quotes the flag, so the parser matches a substring, not a prefix."""
+    build = tmp_path / "build"
+    build.mkdir()
+    (build / "cmake-build.stdout").write_text(
+        'cd /w && /usr/local/cuda/bin/nvcc -x cu -c device_0.cu '
+        '"--generate-code=arch=compute_90,code=[compute_90,sm_90]" -o device_0.cu.o\n'
+    )
+    assert demo_container._compiled_arch(build) == "sm_90"
+
+
+def test_compiled_arch_returns_none_without_the_flag(tmp_path: Path) -> None:
+    """A build log with no architecture yields no claim, which the gate rejects."""
+    build = tmp_path / "build"
+    build.mkdir()
+    (build / "cmake-build.stdout").write_text("cmake --build . --verbose\n")
+    assert demo_container._compiled_arch(build) is None

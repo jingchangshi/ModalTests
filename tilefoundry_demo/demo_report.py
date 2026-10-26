@@ -36,6 +36,7 @@ STAGE_FIELDS = (
 EXPECTED_TARGET = "nvidia.h200_sxm"
 EXPECTED_GPU = "H200"
 EXPECTED_COMPUTE_CAPABILITY = (9, 0)
+EXPECTED_COMPILED_ARCH = "sm_90"
 
 SKIP_PARTS = frozenset(
     {"__pycache__", ".git", ".pytest_cache", "test_results", ".torch_extensions", "ccache"}
@@ -119,7 +120,13 @@ def _worst(statuses: list[str]) -> str:
 
 
 def evaluate_environment(environment: dict | None, preflight_returncode: int | None) -> tuple[str, str]:
-    """Judge the recorded environment claim, not the process that produced it."""
+    """Judge the recorded environment claim, not the process that produced it.
+
+    This stage answers one question the other stages cannot: are the packages
+    that will compile and run the kernel the ones uploaded from this machine?
+    The inventory deltas and the package origin are the evidence for that, so a
+    clean environment with drift in either is not a passing environment.
+    """
     if preflight_returncode is None:
         return STATUS_NOT_RUN, "container preflight never ran"
     if preflight_returncode != 0:
@@ -132,7 +139,52 @@ def evaluate_environment(environment: dict | None, preflight_returncode: int | N
         return STATUS_FAIL, f"{EXPECTED_TARGET} is not a registered target"
     if not environment.get("tools_ok"):
         return STATUS_FAIL, "nvcc, cmake, ninja, or g++ is missing from the image"
-    return STATUS_PASS, "imports, target registration, and build tools are present"
+    return evaluate_source_integrity(environment)
+
+
+def evaluate_source_integrity(environment: dict) -> tuple[str, str]:
+    """Judge whether the installed packages are the uploaded snapshot.
+
+    Three independent observations must agree: both distributions resolve to
+    files inside the uploaded tree, neither was fetched from an index, and the
+    tree on disk still matches the inventory that was digested before upload.
+    """
+    if environment.get("origin_inside_snapshot") is not True:
+        return STATUS_FAIL, (
+            "an installed package resolves outside the uploaded snapshot: "
+            f"tilefoundry={environment.get('tilefoundry_origin')!r} "
+            f"tilefoundry_nvidia={environment.get('tilefoundry_nvidia_origin')!r}"
+        )
+    installations = environment.get("installations")
+    if not isinstance(installations, dict) or set(installations) != {"tilefoundry", "tilefoundry-nvidia"}:
+        return STATUS_ERROR, "no PEP 610 record for both distributions"
+    for name, record in installations.items():
+        if not record or not record.get("dir_info", {}).get("editable"):
+            return STATUS_FAIL, f"{name} is not an editable install of the uploaded tree: {record!r}"
+    source_check = environment.get("source_check")
+    if not isinstance(source_check, dict) or not source_check.get("before_install"):
+        return STATUS_ERROR, "no inventory comparison of the installed tree"
+    for phase in ("before_install", "after_install"):
+        delta = source_check.get(phase)
+        if not isinstance(delta, dict):
+            return STATUS_ERROR, f"the {phase} inventory comparison is missing"
+        for kind in ("missing", "unexpected", "modified"):
+            drifted = delta.get(kind) or []
+            if drifted:
+                return STATUS_FAIL, (
+                    f"the installed tree changed {phase}: {len(drifted)} {kind} file(s), "
+                    f"first {drifted[0]!r}"
+                )
+    version = environment.get("tilefoundry_version")
+    nvidia_version = environment.get("tilefoundry_nvidia_version")
+    if not version or version != nvidia_version:
+        return STATUS_FAIL, (
+            f"core and target versions differ: {version!r} vs {nvidia_version!r}"
+        )
+    return STATUS_PASS, (
+        "both packages resolve inside the uploaded snapshot, neither came from an index, "
+        "and the installed tree matches the digested inventory before and after installation"
+    )
 
 
 def evaluate_gpu(environment: dict | None) -> tuple[str, str]:
@@ -179,9 +231,9 @@ def evaluate_compile(compile_evidence: dict) -> tuple[str, str]:
     if not compile_evidence.get("cu_files"):
         return STATUS_ERROR, "no generated CUDA source was dumped"
     if not compile_evidence.get("cmake_configured"):
-        return STATUS_ERROR, "no successful CMake configure was dumped"
+        return STATUS_ERROR, "CMake configure left no successful result in its dumps"
     if not compile_evidence.get("cmake_built"):
-        return STATUS_ERROR, "no successful CMake build was dumped"
+        return STATUS_ERROR, "CMake build left no successful result in its dumps"
     libraries = compile_evidence.get("libraries") or []
     if not libraries:
         return STATUS_ERROR, "no built shared library was captured"
@@ -190,6 +242,13 @@ def evaluate_compile(compile_evidence: dict) -> tuple[str, str]:
     expected = f"lib{runtime_name.split('.')[0]}.so"
     if libraries[0]["path"].rsplit("/", 1)[-1] != expected:
         return STATUS_FAIL, f"built library is {libraries[0]['path']!r}, expected {expected}"
+    if not libraries[0].get("sha256"):
+        return STATUS_ERROR, "the captured library has no digest"
+    arch = compile_evidence.get("target_arch")
+    if arch is None:
+        return STATUS_ERROR, "the CMake dumps carry no nvcc architecture flag"
+    if arch != EXPECTED_COMPILED_ARCH:
+        return STATUS_FAIL, f"nvcc compiled for {arch}, expected {EXPECTED_COMPILED_ARCH} for the H200 target"
     return STATUS_PASS, f"CMake and nvcc built {expected} from the dumped CUDA source"
 
 

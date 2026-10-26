@@ -57,14 +57,29 @@ def _run_command(command: list[str], *, cwd: Path, log: Path, env: dict | None =
     return process.returncode
 
 
-def _version_line(command: list[str]) -> str | None:
-    """Return the first line of a tool's version output, or ``None`` when it is absent."""
+def _version_line(command: list[str], *, needle: str | None = None) -> str | None:
+    """Return one line of a tool's version output, or ``None`` when it is absent.
+
+    ``nvcc --version`` puts the release on the last line, below a banner, so a
+    needle selects the informative line instead of the first one.
+    """
     try:
         result = subprocess.run(command, capture_output=True, text=True, timeout=120)
     except (OSError, subprocess.SubprocessError):
         return None
-    text = (result.stdout or result.stderr).strip()
-    return text.splitlines()[0] if text else None
+    lines = [
+        line.strip()
+        for line in (result.stdout or result.stderr).splitlines()
+        if line.strip()
+    ]
+    if not lines:
+        return None
+    if needle is not None:
+        for line in lines:
+            if needle in line:
+                return line
+        return None
+    return lines[0]
 
 
 def _origin(module) -> str | None:
@@ -95,13 +110,13 @@ def collect_environment(source_root: Path, log: Path) -> dict:
         "platform": platform.platform(),
         "hostname": platform.node(),
     }
-    for tool, command in (
-        ("nvcc_version", ["nvcc", "--version"]),
-        ("cmake_version", ["cmake", "--version"]),
-        ("ninja_version", ["ninja", "--version"]),
-        ("gxx_version", ["g++", "--version"]),
+    for tool, command, needle in (
+        ("nvcc_version", ["nvcc", "--version"], "release"),
+        ("cmake_version", ["cmake", "--version"], None),
+        ("ninja_version", ["ninja", "--version"], None),
+        ("gxx_version", ["g++", "--version"], None),
     ):
-        environment[tool] = _version_line(command)
+        environment[tool] = _version_line(command, needle=needle)
 
     cutlass_home = os.environ.get("TILEFOUNDRY_CUTLASS_INCLUDE")
     environment["tilefoundry_cutlass_include"] = cutlass_home
@@ -171,7 +186,6 @@ def collect_environment(source_root: Path, log: Path) -> dict:
             environment["compute_capability"] = [properties.major, properties.minor]
             environment["gpu_memory_bytes"] = properties.total_memory
             environment["gpu_count"] = torch.cuda.device_count()
-            environment["cuda_driver"] = getattr(torch.cuda, "driver_version", None)
     except Exception as error:  # noqa: BLE001
         environment.update({"torch_error": f"{type(error).__name__}: {error}", "cuda_available": False})
 
@@ -238,14 +252,50 @@ def _dump_build_dir(dump_root: Path) -> Path:
     return candidates[0] if candidates else dump_root / "missing" / "build"
 
 
-def _cmake_step_ran(build_dir: Path, step: str) -> bool:
-    """Report whether CMake recorded a run of one step.
+def _cmake_step_succeeded(build_dir: Path, step: str) -> bool:
+    """Report whether one CMake step ran and left no failure in its dumps.
 
-    ``link_modules`` dumps each step's command, stdout, and stderr and raises on
-    a non-zero exit, so a dumped ``<step>.cmd.txt`` means the step ran to
-    completion; a failing step aborts compilation before any library exists.
+    ``link_modules`` dumps ``<step>.cmd.txt`` *before* running the step, so the
+    presence of that file only proves the step was attempted. Success is the
+    attempt plus a stderr dump with no ``error:``/``Error`` line in it; a step
+    that fails also aborts compilation, so the library check below would fail
+    too. Both are required rather than either one.
     """
-    return (build_dir / f"{step}.cmd.txt").exists()
+    if not (build_dir / f"{step}.cmd.txt").exists():
+        return False
+    stderr_path = build_dir / f"{step}.stderr"
+    if not stderr_path.exists():
+        return False
+    stderr = stderr_path.read_text(encoding="utf-8", errors="replace")
+    return not any(marker in stderr for marker in ("error:", "Error", "FAILED"))
+
+
+def _compiled_arch(build_dir: Path) -> str | None:
+    """Read the architecture nvcc was told to generate code for.
+
+    The CMake project sets ``CUDA_ARCHITECTURES`` from the target's arch, and the
+    dumped configure/build output carries the resulting ``--generate-code``
+    flags. This reads those flags rather than trusting the target declaration, so
+    a mismatch between the Target and what nvcc compiled is visible in evidence.
+    """
+    for name in ("cmake-build.stdout", "cmake-configure.stdout"):
+        path = build_dir / name
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for marker in ("arch=compute_", "--generate-code=compute_"):
+            start = text.find(marker)
+            if start == -1:
+                continue
+            tail = text[start + len(marker) :]
+            digits = ""
+            for character in tail:
+                if not character.isdigit():
+                    break
+                digits += character
+            if digits:
+                return f"sm_{digits}"
+    return None
 
 
 def run_test(source_root: Path, results_dir: Path, logs_dir: Path, dump_root: Path) -> dict:
@@ -305,13 +355,14 @@ def run_test(source_root: Path, results_dir: Path, logs_dir: Path, dump_root: Pa
         "calls": (observed.get("compile") or {}).get("calls") or [],
         "errors": (observed.get("compile") or {}).get("errors") or [],
         "runtime_name": runtime_name,
-        "cmake_configured": _cmake_step_ran(build_dir, "cmake-configure"),
-        "cmake_built": _cmake_step_ran(build_dir, "cmake-build"),
+        "cmake_configured": _cmake_step_succeeded(build_dir, "cmake-configure"),
+        "cmake_built": _cmake_step_succeeded(build_dir, "cmake-build"),
         "build_directory": build_dir.relative_to(dump_root.parent).as_posix(),
         "capture_directory": build_capture.get("directory"),
         "cu_files": sorted(path.name for path in build_dir.glob("*.cu")),
         "libraries": build_capture.get("libraries") or [],
         "build_source": build_capture.get("source"),
+        "target_arch": _compiled_arch(build_dir),
     }
     if build_capture.get("error"):
         compile_evidence["errors"] = [*compile_evidence["errors"], build_capture["error"]]
@@ -336,6 +387,8 @@ def _bundle(root: Path, run_id: str, volume_root: Path) -> dict:
     destination = volume_root / "runs" / run_id
     destination.mkdir(parents=True, exist_ok=True)
     remote = destination / archive.name
+    if remote.exists():
+        raise FileExistsError(f"{remote} already exists; a run id must name one run")
     shutil.copy2(archive, remote)
     return {
         "archive_path": remote.relative_to(volume_root).as_posix(),
@@ -379,7 +432,15 @@ def preflight(source_root: Path, payload: dict) -> dict:
     }
     environment["preflight_returncode"] = 0 if environment.get("imports_ok") else 1
     statuses = evaluate(
-        {"environment": environment, "preflight_returncode": environment["preflight_returncode"]}
+        {
+            "environment": environment,
+            "preflight_returncode": environment["preflight_returncode"],
+            "analysis": {"returncode": None},
+            "compile": {"calls": []},
+            "execution": {},
+            "correctness": {},
+            "pytest": {"returncode": None},
+        }
     )
     environment["environment_status"] = statuses["environment_status"]
     environment["environment_reason"] = statuses["stages"]["environment"]["reason"]
@@ -420,9 +481,7 @@ def _run(payload: dict, source_root: Path) -> dict:
     exception_text: str | None = None
 
     try:
-        source_check["before_install"] = (
-            inventory_delta(expected_inventory, inventory(source_root)) if expected_inventory else None
-        )
+        source_check["before_install"] = inventory_delta(expected_inventory, inventory(source_root))
         environment = collect_environment(source_root, logs_dir / "environment.log")
         evidence["environment"] = environment
         evidence["preflight_returncode"] = 0 if environment.get("imports_ok") else 1
@@ -437,13 +496,13 @@ def _run(payload: dict, source_root: Path) -> dict:
                     "correctness": observed["correctness"],
                 }
             )
-        source_check["after_install"] = (
-            inventory_delta(expected_inventory, inventory(source_root)) if expected_inventory else None
-        )
+        source_check["after_install"] = inventory_delta(expected_inventory, inventory(source_root))
     except BaseException as error:  # noqa: BLE001 - a crash is evidence, not a silent abort
         exception_text = f"{type(error).__name__}: {error}\n\n{_tail(logs_dir / 'compile-and-test.log')}"
         (logs_dir / "exception.txt").write_text(exception_text + "\n", encoding="utf-8")
 
+    if evidence["environment"] is not None:
+        evidence["environment"]["source_check"] = source_check
     statuses = evaluate(evidence)
     elapsed = round(time.monotonic() - started, 3)
     environment = evidence["environment"] or {}

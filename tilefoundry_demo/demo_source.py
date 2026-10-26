@@ -115,7 +115,11 @@ def snapshot_identity(repo: Path, staging: Path, files: list[dict]) -> dict:
 
 
 def prepare(repo: Path, root: Path | None = None) -> tuple[Path, dict, list[dict]]:
-    """Freeze *repo* into a staging directory and return it with its identity."""
+    """Freeze *repo* into a staging directory and return it with its identity.
+
+    The caller owns the returned staging directory and should remove it when the
+    run ends; :func:`cleanup` does that for the path recorded in the identity.
+    """
     root = Path(root) if root is not None else Path(tempfile.mkdtemp(prefix="tilefoundry-demo-src-"))
     staging = root / "tilefoundry"
     before = git_identity(repo)
@@ -126,3 +130,13 @@ def prepare(repo: Path, root: Path | None = None) -> tuple[Path, dict, list[dict
             "prepare: the working tree changed while it was being frozen; run the demo again"
         )
     return staging, snapshot_identity(repo, staging, files), files
+
+
+def cleanup(identity: dict) -> None:
+    """Remove the staging directory one snapshot was frozen into."""
+    staging = identity.get("staging_dir")
+    if not staging:
+        return
+    root = Path(staging).parent
+    if root.name.startswith("tilefoundry-demo-src-") and root.is_dir():
+        shutil.rmtree(root, ignore_errors=True)
