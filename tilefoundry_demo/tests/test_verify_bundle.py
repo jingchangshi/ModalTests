@@ -113,7 +113,19 @@ def build_bundle(root: Path, evidence: dict | None = None) -> Path:
     (bundle / "generated/test/build").mkdir(parents=True)
     (bundle / "results/analysis.json").write_text(json.dumps({"target": "nvidia.h200_sxm", "executed": ["compute-cost", "memory"]}))
     (bundle / "results/junit.xml").write_text(JUNIT)
-    (bundle / "results/test-results.json").write_text(json.dumps({"compile": evidence["compile"], "execution": evidence["execution"], "correctness": evidence["correctness"]}))
+    # Mirror the real container: test-results.json records what the pytest session
+    # observed, which does not include the compile stage's library records. Those live
+    # only in the manifest, so copying them here would hide a wrong source of truth.
+    observed_compile = {k: v for k, v in evidence["compile"].items() if k != "libraries"}
+    (bundle / "results/test-results.json").write_text(
+        json.dumps(
+            {
+                "compile": observed_compile,
+                "execution": evidence["execution"],
+                "correctness": evidence["correctness"],
+            }
+        )
+    )
     (bundle / "logs/compile-and-test.log").write_text("1 passed\n")
     (bundle / "generated/build/build/libTirSquare.so").write_bytes(SHARED_LIBRARY)
     (bundle / "generated/test/build/module.device_0.cu").write_text("__global__ void k() {}\n")
@@ -364,3 +376,29 @@ def test_a_duplicate_file_entry_is_rejected(tmp_path: Path) -> None:
     result["artifacts_bundle"]["archive_bytes"] = archive.stat().st_size
     failures = verify_bundle.verify(archive, result, tmp_path / "work2")
     assert any("twice" in item for item in failures)
+
+
+def test_library_records_are_taken_from_the_manifest_not_the_test_results(
+    tmp_path: Path,
+) -> None:
+    """The compile stage's library records live in the manifest, not in test-results.json.
+
+    A run against the real container exposed this: test-results.json carries what the
+    pytest session observed and has no `libraries` key, so a verifier that read the
+    library list from there rejected every genuine bundle with "the archived evidence
+    records no compiled library". Pin the source of truth by emptying the test-results
+    copy while leaving the manifest intact.
+    """
+    archive = build_bundle(tmp_path)
+    result = printed_result(archive)
+    bundle = _extract_all(archive, tmp_path / "work")
+    observed_path = bundle / "results/test-results.json"
+    observed = json.loads(observed_path.read_text())
+    assert "libraries" not in observed["compile"], "the fixture must mirror the real container"
+    archive = _rearchive(bundle)
+
+    result["artifacts_bundle"]["archive_sha256"] = verify_bundle.sha256_file(archive)
+    result["artifacts_bundle"]["archive_bytes"] = archive.stat().st_size
+    failures = verify_bundle.verify(archive, result, tmp_path / "work2")
+    assert not any("no compiled library" in item for item in failures), failures
+    assert not any("which no compile record names" in item for item in failures), failures

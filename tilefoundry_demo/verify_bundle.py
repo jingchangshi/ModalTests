@@ -123,10 +123,15 @@ def check_file_list(bundle: Path, manifest: dict) -> list[str]:
     return failures
 
 
-def check_libraries(bundle: Path, observed: dict) -> list[str]:
-    """Bind each archived shared library to the digest the compiler reported."""
+def check_libraries(bundle: Path, evidence: dict) -> list[str]:
+    """Bind each archived shared library to the digest the compiler reported.
+
+    The library records live in the bundle manifest's `evidence.compile`, not in
+    `results/test-results.json`: the test-results file reports what the pytest
+    session observed, while the manifest records what the compile stage returned.
+    """
     failures: list[str] = []
-    libraries = (observed.get("compile") or {}).get("libraries") or []
+    libraries = (evidence.get("compile") or {}).get("libraries") or []
     if not libraries:
         return ["the archived evidence records no compiled library, so the .so is unattributed"]
     by_name = {}
@@ -212,7 +217,7 @@ def verify(archive: Path, result: dict, workdir: Path) -> list[str]:
     if not comparisons or comparisons[0].get("rtol") != 0 or comparisons[0].get("atol") != 0:
         failures.append("the archived comparison was not tolerance-free")
 
-    failures += check_libraries(bundle, observed)
+    failures += check_libraries(bundle, evidence)
     if not any(bundle.glob("generated/**/*.cu")):
         failures.append("the archive holds no generated CUDA source")
 
