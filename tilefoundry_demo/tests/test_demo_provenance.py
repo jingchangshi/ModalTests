@@ -168,3 +168,37 @@ def test_the_reducer_passes_an_environment_with_no_provenance_failures() -> None
     )
     status, reason = demo_report.evaluate_environment(environment, 0)
     assert status == demo_report.STATUS_PASS, reason
+
+
+def test_a_cpu_preflight_needs_no_post_execution_inventory() -> None:
+    """Preflight stops before execution, so demanding that phase would fail every preflight.
+
+    A real CPU-only run reported exactly this, so the rule is pinned here: the
+    post-image-build comparison is mandatory, the post-execution one is conditional.
+    """
+    environment = clean()
+    environment["source_check"] = {
+        "post_image_build": {"missing": [], "unexpected": [], "modified": []},
+        "post_execution": None,
+    }
+    assert demo_provenance.check_provenance(environment, ROOT) == []
+
+
+def test_a_preflight_without_the_post_image_build_inventory_is_rejected() -> None:
+    """The one comparison that must always exist cannot be omitted."""
+    environment = clean()
+    environment["source_check"] = {"post_execution": None}
+    failures = demo_provenance.check_provenance(environment, ROOT)
+    assert any("post_image_build" in item for item in failures)
+
+
+def test_post_execution_drift_is_still_rejected() -> None:
+    """Relaxing the preflight case must not weaken the executed case."""
+    environment = clean()
+    environment["source_check"]["post_execution"] = {
+        "missing": ["src/tilefoundry/gone.py"],
+        "unexpected": [],
+        "modified": [],
+    }
+    failures = demo_provenance.check_provenance(environment, ROOT)
+    assert any("post_execution" in item and "missing" in item for item in failures)

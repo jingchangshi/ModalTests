@@ -110,7 +110,17 @@ if modal.is_local():
             "cd /opt/tilefoundry && find . -name '*.egg-info' -prune -exec rm -rf {} +",
             "python -c 'import tilefoundry, tilefoundry_nvidia; print(tilefoundry.__file__)'",
         )
-        .add_local_python_source("demo_container", "demo_report", "demo_pytest_plugin")
+        # Every module run_demo imports must be present, because the container re-imports
+        # this file. A missing one fails at container import, before any stage runs.
+        .add_local_python_source(
+            "demo_build_inputs",
+            "demo_container",
+            "demo_provenance",
+            "demo_pytest_plugin",
+            "demo_report",
+            "demo_source",
+            "demo_task",
+        )
     )
 else:
     STAGING = None

@@ -162,13 +162,17 @@ def test_run_reports_missing_stages_without_claiming_success(tmp_path: Path, mon
             "python_version": "3.12.0",
             "tilefoundry_version": "0.0.0+demo.dddd",
             "tilefoundry_nvidia_version": "0.0.0+demo.dddd",
-            "tilefoundry_origin": "/opt/tilefoundry/src/tilefoundry/__init__.py",
-            "tilefoundry_nvidia_origin": "/opt/tilefoundry/targets/nvidia/tilefoundry_nvidia/__init__.py",
+            # Origins follow the real source root, so `_run`'s provenance re-check sees a
+            # coherent install and the assertions below test orchestration, not this stub.
+            "tilefoundry_origin": f"{source_root}/src/tilefoundry/__init__.py",
+            "tilefoundry_nvidia_origin": (
+                f"{source_root}/targets/nvidia/tilefoundry_nvidia/__init__.py"
+            ),
             "origin_inside_snapshot": True,
             "installations": {
-                "tilefoundry": {"url": "file:///opt/tilefoundry", "dir_info": {"editable": True}},
+                "tilefoundry": {"url": f"file://{source_root}", "dir_info": {"editable": True}},
                 "tilefoundry-nvidia": {
-                    "url": "file:///opt/tilefoundry/targets/nvidia",
+                    "url": f"file://{source_root}/targets/nvidia",
                     "dir_info": {"editable": True},
                 },
             },
@@ -260,10 +264,17 @@ def test_run_fails_when_the_installed_tree_lost_a_selected_file(tmp_path: Path, 
             "target_registered": True,
             "tools_ok": True,
             "origin_inside_snapshot": True,
+            # A provenance-clean stub: these tests assert about the inventory drift, so the
+            # installation record must not fail on its own and mask the intended reason.
             "installations": {
-                "tilefoundry": {"dir_info": {"editable": True}},
-                "tilefoundry-nvidia": {"dir_info": {"editable": True}},
+                "tilefoundry": {"url": f"file://{source}", "dir_info": {"editable": True}},
+                "tilefoundry-nvidia": {
+                    "url": f"file://{source}/targets/nvidia",
+                    "dir_info": {"editable": True},
+                },
             },
+            "tilefoundry_origin": f"{source}/src/tilefoundry/__init__.py",
+            "tilefoundry_nvidia_origin": f"{source}/targets/nvidia/tilefoundry_nvidia/__init__.py",
             "tilefoundry_version": "0.0.0+demo.dddd",
             "tilefoundry_nvidia_version": "0.0.0+demo.dddd",
         },

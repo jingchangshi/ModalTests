@@ -101,23 +101,29 @@ def check_provenance(environment: dict, source_root: str) -> list[str]:
 
     source_check = environment.get("source_check")
     if not isinstance(source_check, dict):
-        failures.append("no inventory comparison of the installed tree")
-    else:
-        from demo_report import INVENTORY_PHASES
+        return failures + ["no inventory comparison of the installed tree"]
 
-        if not source_check.get(INVENTORY_PHASES[0]):
-            failures.append(f"no {INVENTORY_PHASES[0]} inventory comparison")
-        for phase in INVENTORY_PHASES:
-            delta = source_check.get(phase)
-            if not isinstance(delta, dict):
-                continue
-            for kind in ("missing", "unexpected", "modified"):
-                drifted = delta.get(kind) or []
-                if drifted:
-                    failures.append(
-                        f"the installed tree changed {phase}: {len(drifted)} {kind} file(s), "
-                        f"first {drifted[0]!r}"
-                    )
+    from demo_report import PHASE_POST_IMAGE_BUILD, PHASE_POST_EXECUTION
+
+    # The post-image-build comparison must always exist: it is the first thing that can
+    # prove the install matches the digest. The post-execution one cannot exist during a
+    # CPU preflight, which stops before any execution, so its absence there is expected
+    # and is reported separately rather than counted as a failure.
+    observed = source_check.get(PHASE_POST_IMAGE_BUILD)
+    if not isinstance(observed, dict):
+        failures.append(f"no {PHASE_POST_IMAGE_BUILD} inventory comparison")
+
+    for phase in (PHASE_POST_IMAGE_BUILD, PHASE_POST_EXECUTION):
+        delta = source_check.get(phase)
+        if not isinstance(delta, dict):
+            continue
+        for kind in ("missing", "unexpected", "modified"):
+            drifted = delta.get(kind) or []
+            if drifted:
+                failures.append(
+                    f"the installed tree changed {phase}: {len(drifted)} {kind} file(s), "
+                    f"first {drifted[0]!r}"
+                )
     return failures
 
 

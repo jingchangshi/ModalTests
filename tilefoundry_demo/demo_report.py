@@ -189,6 +189,10 @@ def evaluate_source_integrity(environment: dict) -> tuple[str, str]:
     for phase in INVENTORY_PHASES:
         delta = source_check.get(phase)
         if not isinstance(delta, dict):
+            # A CPU preflight stops after the install, so it cannot have an
+            # execution-phase comparison. Demanding one there failed every preflight.
+            if phase == PHASE_POST_EXECUTION and environment.get("preflight_only") is True:
+                continue
             return STATUS_ERROR, f"the {phase} inventory comparison is missing"
         for kind in ("missing", "unexpected", "modified"):
             drifted = delta.get(kind) or []

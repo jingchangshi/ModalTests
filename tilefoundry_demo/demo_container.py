@@ -158,10 +158,9 @@ def collect_environment(source_root: Path, log: Path) -> dict:
     environment["origin_inside_snapshot"] = all(
         origin is not None and origin.startswith(str(source_root) + os.sep) for origin in origins
     )
-    # The full P0-4 rule: exact install URL, import path inside it, one shared version, and
-    # an installed tree that still matches the digested inventory. `origin_inside_snapshot`
-    # above only says "somewhere under the snapshot"; this names every discrepancy.
-    environment["provenance_failures"] = check_provenance(environment, str(source_root))
+    # `origin_inside_snapshot` above only says "somewhere under the snapshot". The full
+    # P0-4 rule also reads the inventory comparison, which the caller attaches after this
+    # function returns, so it is judged by `judge_provenance` rather than here.
 
     try:
         from tilefoundry_nvidia import CudaTarget
@@ -466,6 +465,16 @@ def main() -> int:
     return 0 if manifest["overall_status"] == "PASS" else 1
 
 
+def judge_provenance(environment: dict, source_root: Path) -> None:
+    """Apply the full provenance rule once the inventory comparison is attached.
+
+    ``collect_environment`` cannot do this itself: the inventory delta is computed by the
+    caller afterwards, and the rule reads it. Running it too early reported a missing
+    comparison even when the comparison was present.
+    """
+    environment["provenance_failures"] = check_provenance(environment, str(source_root))
+
+
 def preflight(source_root: Path, payload: dict) -> dict:
     """Prove the uploaded snapshot is what got installed, without touching a GPU."""
     root = Path("/tmp/tilefoundry-demo") / payload["run_id"] / "preflight"
@@ -481,6 +490,10 @@ def preflight(source_root: Path, payload: dict) -> dict:
         PHASE_POST_IMAGE_BUILD: post_image_build,
         PHASE_POST_EXECUTION: None,
     }
+    # This record is the only one that legitimately lacks an execution-phase comparison, so
+    # it says so rather than leaving a reader to infer it from a null.
+    environment["preflight_only"] = True
+    judge_provenance(environment, source_root)
     environment["preflight_returncode"] = 0 if environment.get("imports_ok") else 1
     statuses = evaluate(
         {
@@ -554,6 +567,10 @@ def _run(payload: dict, source_root: Path) -> dict:
 
     if evidence["environment"] is not None:
         evidence["environment"]["source_check"] = source_check
+        # Now that both comparisons exist, apply the full rule. The preflight judged the
+        # install alone; this judgement also covers whether execution changed the tree.
+        evidence["environment"].pop("preflight_only", None)
+        judge_provenance(evidence["environment"], source_root)
     statuses = evaluate(evidence)
     elapsed = round(time.monotonic() - started, 3)
     environment = evidence["environment"] or {}
