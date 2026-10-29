@@ -229,3 +229,228 @@ causal，教程 06 v3.8.0 移植），run `20260912-154624`，sm86：
   TritonGPURemoveLayoutConversions 0.55 s）+ ptxas×6 + autotuner bench 循环 + torch 导入。
 
 新用例跑完后建议把基线追加到本节。
+
+---
+
+## 9 · tilefoundry_demo（跨服务器可运行的 TileFoundry-on-Modal 演示）
+
+> 本节起是**另一个子项目**，与第 1–8 节的 `triton/` 工作区相互独立：两条代码路径、两套
+> 入口、两套依赖。第 2 节里的 conda 环境名与 Modal profile 名是 `triton/` 那台机器的本地
+> 约定，**不适用于本节**；本节的要求只写在这里。
+
+### 9.1 定位与目录
+
+```text
+tilefoundry_demo/                 # 在 tilefoundry_demo/ 目录内执行 modal run
+├── run_demo.py                   # 主入口：冻结本地 checkout → 上传镜像 → HIR 分析 → H200 编译/执行/比对 → 归档证据包
+├── run_experiments.py            # RMSNorm + FP8 教程实验驱动（复用 run_demo 的镜像）
+├── demo_container.py             # 容器内 stage 编排与证据采集
+├── demo_task.py                  # 任务规格校验、stage/case/source 白名单
+├── demo_report.py                # 证据归约：每个 stage 一个状态
+├── demo_source.py / demo_build_inputs.py / demo_provenance.py
+├── demo_pytest_plugin.py         # 容器内 pytest 观察插件
+├── verify_bundle.py              # 校验下载回来的证据包
+└── tasks/*.json                  # 任务注册表（stage 列表 + 期望结果 + 限额）
+```
+
+### 9.2 机器上只需要什么（跨服务器成立）
+
+| 需要 | 说明 |
+|---|---|
+| git | 克隆本仓库与并排的 TileFoundry checkout |
+| python3（客户端 3.11+） | 只用来跑 `modal` 客户端；venv 足够 |
+| `modal` 客户端 | `python -m pip install modal` |
+| 网络 | 访问 Modal API |
+| 有效的 Modal 账号 | 已登录；H200 容量可用 |
+
+不需要（这几点是本节的核心，改动时不要收回）：
+
+- **no local GPU**：不需要 GPU，也不需要 `nvidia-smi`；所有设备操作都在远端 H200 容器里。
+- **no local CUDA**：不需要本地 CUDA / nvcc / CMake / CUTLASS。
+- **no local PyTorch**：不需要本地 PyTorch / transformers。
+- **no local TileFoundry**：不需要本地安装；checkout 只是被打包进镜像。
+- 不需要旧服务器的 conda 目录，也不需要任何 conda 环境。
+
+Modal profile 名是任意的：只要 `modal profile current` 成功即可。换一台机器用
+`modal token new`（或 `modal setup`）建任意名字的 profile 都能跑；本仓库不读
+`MODAL_PROFILE`，也不要求某个特定名字。
+
+```bash
+python3 -m venv "$HOME/.venvs/tilefoundry-modal"
+source "$HOME/.venvs/tilefoundry-modal/bin/activate"
+python -m pip install modal
+modal profile current          # 成功即可，名字无所谓
+```
+
+### 9.3 TileFoundry checkout 的解析顺序
+
+源码在**模块导入时**被冻结、摘要并上传，所以路径必须在 `modal run` 之前确定。解析顺序仅此三条
+（`run_demo.resolve_tilefoundry_repo()`）：
+
+1. `--tilefoundry-repo PATH`（命令行参数）；
+2. `$TILEFOUNDRY_REPO`（环境变量，非空时）；
+3. 并排自动发现（sibling）：**本仓库旁边**名为 `TileFoundry` 的目录，即
+   `<workspace>/TileFoundry` 与 `<workspace>/ModalTests` 并列——正是 9.4 那种布局，
+   所以那里 `export TILEFOUNDRY_REPO` 是双保险而非必需。候选路径由 `run_demo.py` 自身位置
+   推出（相对 `tilefoundry_demo/` 上两级），因此从任何工作目录执行结果都一样；
+   **任何候选都不读当前工作目录**。
+
+候选目录必须含 `pyproject.toml` 才算数。三条都不成立时，在**任何镜像构建之前**直接失败，
+不产生 GPU 费用、不上传任何东西，报错首行是：
+
+```text
+no TileFoundry checkout was found, so no Modal image was built.
+```
+
+推荐用环境变量而不是参数：源码在导入时冻结，与冻结快照不一致的参数会被拒绝，而环境变量
+在导入时就已生效。该路径必须是真正的 git clone，因为 manifest 记录 commit、分支、dirty
+状态以及 CUTLASS 子模块 SHA。
+
+### 9.4 运行命令（在 `tilefoundry_demo/` 内执行）
+
+```bash
+export TILEFOUNDRY_REPO="$HOME/workspace/TileFoundry"
+cd "$HOME/workspace/ModalTests/tilefoundry_demo"
+
+modal run run_demo.py --cpu-only                      # 无 GPU 预检：改依赖后先跑这个
+modal run run_demo.py                                 # 默认任务 tasks/square.json（1×H200）
+modal run run_demo.py --task tasks/square_cpu.json    # CPU-only 任务
+modal run run_demo.py --run-id my-run-1               # 指定 run id，否则自动生成
+modal run run_experiments.py --experiment all         # correctness + twin + benchmark
+```
+
+- `--cpu-only` 只跑到 preflight 为止；它证明镜像可装、两个包可导入、H200 target 已注册，
+  但**不**声称任务完成（有 GPU stage 时 `task_status` 为 `NOT_RUN`）。
+- 容器内固定目录 `/opt/tilefoundry`、`/opt/cutlass/include`、`/artifacts`、`/tmp`、
+  `/tmp/tilefoundry-demo`、`/cases` 只存在于容器内部，**不是**宿主机的路径依赖。
+- 下载与校验：运行结束会打印 `modal volume get` 命令；下载后用
+  `python verify_bundle.py <archive> --result results/<run-id>/remote-result.json` 校验，
+  输出 `VERIFY OK` 才说明归档、manifest、判决三者一致。
+
+### 9.5 stage 与状态词汇
+
+任务规格从 `tasks/*.json` 选 stage，stage 类型是**注册表白名单**，任务不能自定义新类型：
+`environment`、`hir_analyze`、`hir_check`、`gpu_test`、`gpu_benchmark`、`archive`。
+`demo_task.assert_runner_support()` 在加载任务时执行：本 runner 没有执行器的 stage 类型，
+或注册在**别的 runner** 名下的 GPU case，都会在构建任何镜像、分配任何 GPU 之前作为本地
+`SystemExit` 被拒绝，而不是执行一半再报成"运行过"。
+
+每个 stage 独立归约，只可能是下面之一：
+
+| 状态 | 含义 |
+|---|---|
+| `PASS` | 该 stage 自己的证据支持它 |
+| `FAIL` | 跑过了，证据与声明矛盾 |
+| `ERROR` | 跑了但产不出可判定的观测，或直接抛异常 |
+| `BLOCKED` | 缺少它无法满足的前提（例如没有 CUDA 设备） |
+| `NOT_RUN` | 没跑；`overall_reason` 说明缺哪一个、为什么 |
+| `EXPECTED_FAIL_CONFIRMED` | 按任务声明**预期失败**且证据吻合；这是"确认了预期失败"，不是 `PASS`，绝不声称 kernel 跑通 |
+
+`overall_status` 取**已有判决的 stage** 里最差的状态（`PASS` 与 `EXPECTED_FAIL_CONFIRMED`
+并列最好）。状态常量以 `demo_report.py` 为准，文档不另写一套；本地测试会核对文档与代码一致。
+
+`archive` **也会被判定**，只是发生在最后：tarball 真的写进 Volume 并记下摘要与大小之后，它变成
+`PASS`，理由形如 `archived 4024663 bytes as runs/<run-id>/...tar.gz`。这里有一个由顺序带来的
+细节：归档**内部**那份 `manifest.json` 是在归档存在之前写的，所以它必然记的是归档前的
+`overall_status`——正因如此，`verify_bundle.py` 对这一条 stage 用运行打印出来的结果信封重算，
+而不是相信归档里的副本。
+
+证据里的 stage 键名是**任务自己的 stage id**，不是固定的五个旧名字：`tasks/square.json` 报
+`environment`/`analyze`/`square`/`archive`，`tasks/square_cpu.json` 报
+`environment`/`analyze`/`check`/`archive`。同一份 `manifest.json` 还带 `task_stages`：按执行
+顺序每个 stage 一条，含 `stage_id`、`type`、`command`、`executed`。
+
+此外它把**完整校验过的任务规格**原样存在 `task` 键下，与 `task_id`、`task_spec_sha`、
+`task_stages`、`completion_scope` 并列。这是归档"自描述"的依据：`verify_bundle.py` 只凭下载
+回来的归档就能重算判决——它按 `task` 声明的 stage 集合裁剪证据，而不是按检查器里写死的固定
+清单，所以一个归档无法事后被重新解释成别的任务。
+
+旧的五个键
+（`environment_status`、`analysis_status`、`compile_status`、`execution_status`、
+`correctness_status`）为兼容保留，但已改为**由任务的 stage 派生**——所以 CPU-only 任务把设备
+相关的键报成 `NOT_RUN`，而不是继承一个它从未请求过的判决。
+
+`completion_scope`（`full` / `cpu_only`）与 stage 状态是两回事，前者只说本次调用的覆盖范围。
+`--cpu-only` 会写 `completion_scope=cpu_only`，并把每个声明了的 GPU stage 记为 `NOT_RUN`，
+原因字符串是 `this invocation does not allocate a GPU, so a device stage was not run`：
+有 GPU stage 时 `task_status` 为 `NOT_RUN`，纯 CPU 任务为 `COMPLETE`。
+
+### 9.6 RMSNorm + FP8 参考数据（不提交，每轮在 Modal CPU 容器内重生）
+
+`x.pt`、`expected.pt`、`model.safetensors` **不在 git 里**（`cases/rmsnorm_fp8/.gitignore`
+已忽略），每次运行都在 Modal CPU 容器内重新生成，且**先于任何 GPU 申请**：
+
+1. 只上传 case 的**源码**到该 run 专属前缀 `experiments/<run-id>/cases/rmsnorm_fp8/`：
+   `config.json`、`make_reference.py`、`rms_norm_quant.py`、`rms_norm_quant_opt.py`、
+   `twin.py`、`benchmark.py`，以及存在时的 `agent_candidate.py`。不读、不拷贝上一台机器
+   产生的任何数据——三个参考数据文件**故意不在**这个清单里。
+2. 一个 Modal **CPU** Function（没有 `gpu=`）在私有 `/tmp` 工作目录里跑
+   `make_reference.py`，并按 case 契约校验产物：`x.pt` `[2, 7168]` bf16、
+   `expected.pt` 为 `[quant (2, 7168) float8_e4m3fn, scale (2, 56) float32]` 两元素、
+   `model.safetensors` 的 `gamma` `[1, 7168]` bf16；同时记录每个文件的 SHA-256、
+   `make_reference.py` 与 `config.json` 的摘要、脚本写出的 provenance、以及容器内
+   torch/transformers/safetensors 的实际版本。
+3. 生成并校验通过后才调用 GPU Function：它重新读该 run 的 manifest、把 case 拷进私有目录、
+   并逐个复核参考数据的摘要，因此不可能拿别的 run 的数据做基准。
+
+生成失败时记成一条 error 记录，主机随后以 `SystemExit` 停止，文本含
+`reference generation failed` 与 `No GPU was allocated and no experiment was run.`；
+GPU Function **绝不会被调用**（`tests/test_run_experiments.py` 断言此时唯一的远端调用就是
+生成器本身）。所以新机器上不需要本地 torch，也不需要从旧机器拷贝任何参考数据。
+`--run-id` 可显式命名 run，否则自动生成；本地记录落在
+`results/experiments-<run-id>/experiments.json`。
+
+一次已验收的真实运行（run `20261029-082303-087224`）作为参照，不是对未来运行的承诺：
+`x.pt` 30015 B / `4d3206a53565d4ce…`，`expected.pt` 16685 B / `7adfcdf1207747c9…`，
+`model.safetensors` 14416 B / `4d3e4270115742c0…`；生成器摘要
+`make_reference.py` `207b6379beef8f9e…`、`config.json` `67ba5386a7d28983…`；容器内
+torch `2.9.1+cu128`、transformers `5.14.1`、safetensors `0.8.0`。
+
+> 注意：这个演示容器里的 Triton 是 **3.5.1**，与第 3 节 `triton/` 子项目那套 3.8.0
+> 不是同一个环境，不要把两节的版本号互相套用。
+
+benchmark 记录同时写下测得的数与对照的基线（100 次重复、10 次 warmup、
+`torch.cuda.Event` 计时）：torch 基线中位 `0.130160 ms`（p10 `0.127296` / p90 `0.138496`），
+Triton twin 中位 `0.030288 ms`（p10 `0.028864` / p90 `0.032928`）；并记录与参考数据的一致性
+`quant_equal_fraction` `0.9999995`、`scale_max_abs_diff` `0.0`。这些数不构成性能预测，只说明
+跑它的那块卡实测到了什么、跟什么比。
+
+`cases/rmsnorm_fp8/tutorial-provenance.json` 与 `cases/rmsnorm_fp8/reference-provenance.json`
+是**历史记录**（上一次运行留下的），不要改写、也不要当成当前轮的 provenance；新运行会在
+自己生成的数据旁边写自己的记录。
+
+### 9.7 本地测试（无需 GPU、无需 torch、无需真实 Modal 客户端）
+
+```bash
+cd "$(git rev-parse --show-toplevel)/tilefoundry_demo"
+python -m pytest tests -q
+```
+
+这套测试是纯 CPU 的，和第 2 节对 `triton/` 的"不要本地跑 pytest"约定**不同**：`triton/`
+的测试要在远端 GPU 上跑，而 `tilefoundry_demo/` 的本地测试用 stub 顶替 Modal，断言的是
+"证据不能被伪造"这类不变量，所以在本地跑是正确做法。
+
+**唯一的前置条件**：`run_demo.py` 在 import 时就冻结源码快照（9.3），而下列测试文件在
+模块级 import 它，所以本机必须能解析到一个 TileFoundry checkout：
+`tests/test_run_demo.py`、`tests/test_checkout_resolution.py`、
+`tests/test_task_runner_match.py`。`export TILEFOUNDRY_REPO=...` 或按 9.3 并排放一个
+`TileFoundry/` 即可；否则只有这三个文件会在 import 阶段报
+`no TileFoundry checkout was found`，其余测试文件照常通过。这个 checkout 不会被安装，
+只被读取和摘要。
+
+其中 `tests/test_no_machine_paths.py` 是本节能跨服务器的可执行保证：它扫描被 git 跟踪的
+运行时文件（根目录所有 `*.py`、`tasks/*.json`、RMSNorm case 源码与 `config.json`、
+`README.md`），拒绝任何 `/home/<user>` 字符串、任何 conda 路径或激活、任何 `modal profile`
+名字要求、任何文档命令里的绝对 `cd`；同时**显式允许**容器内部路径与两份历史 provenance
+文件；并拒绝任何被跟踪的参考数据二进制。改本节或 README 时先让它变绿。
+
+### 9.8 与 `triton/` 子项目的关系
+
+| | `triton/` | `tilefoundry_demo/` |
+|---|---|---|
+| 入口 | `modal run study_compiler.py` | `modal run run_demo.py` |
+| 远端产物 | IR dump 压缩包 → Volume | 证据 tar.gz → Volume + 本地 `results/` |
+| 本地 pytest | 不要跑（必须远端 GPU） | 必须跑（纯 CPU、stub 掉 Modal） |
+| 本机环境 | 需要那台机器的 conda 环境与 profile | 任意 Linux + venv + `modal` 客户端 |
+
+两者不要互相套用对方的运行约定；唯一共享的是"Modal 平台上跑远端 GPU"这件事本身。
