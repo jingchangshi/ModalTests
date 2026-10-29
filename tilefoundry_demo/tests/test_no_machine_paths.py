@@ -784,8 +784,13 @@ def _unquoted_backslash_n(body: str) -> list[int]:
             if char in ("'", '"'):
                 quote = char
                 index += 1
-            elif char == "\\" and body[index + 1 : index + 2] == "n":
-                offsets.append(index)
+            elif char == "\\":
+                # Outside quotes shell escapes exactly one character, so two
+                # backslashes are one literal backslash and a following "n" is plain
+                # text. Re-examining the escaped character instead would read
+                # "a\\nb" as a collapse and let an escaped quote open a quote.
+                if body[index + 1 : index + 2] == "n":
+                    offsets.append(index)
                 index += 2
             else:
                 index += 1
@@ -841,13 +846,13 @@ def test_documented_shell_blocks_are_copy_pasteable() -> None:
 def test_the_copy_pasteable_gate_catches_the_escaping_bug() -> None:
     """The gate must fail on the shapes it exists to catch, not pass vacuously.
 
-    The doubled form is the one the real defect had: the historical README carried
-    four lines ending in two backslashes and zero collapsed escapes, so that shape is
-    anchored by an actual regression. The collapsed form is pinned by its
-    discriminating variants, including the one a "followed by a space" rule misses: a
-    swallowed line that began at column zero.
+    The doubled form is the one the real defect had, and it needs a real newline
+    after the two backslashes: that is what made the historical README four lines
+    ending in a doubled backslash. A fixture without the newline is an escaped
+    backslash followed by a letter, which is valid shell, so the shape is pinned
+    here exactly as the archive carries it.
     """
-    doubled = "```bash\nmodal volume get a \\\\n  b \\\\n  c\n```"
+    doubled = "```bash\nmodal volume get a \\\\\n  b\\\\\n  c\n```"
     collapsed_indented = "```bash\nmodal volume get a \\n      b\n```"
     collapsed_unindented = "```bash\nmodal volume get a \\narg\n```"
     for broken in (doubled, collapsed_indented, collapsed_unindented):
@@ -859,7 +864,9 @@ def test_the_copy_pasteable_gate_accepts_escapes_the_command_means() -> None:
 
     Both quote styles and both following characters are covered, because the rule this
     replaced keyed off what came after the escape: an escape followed by a space is
-    ordinary, valid shell and must not be reported as a lost line break.
+    ordinary, valid shell and must not be reported as a lost line break. The last case
+    is the other edge of the same rule: two backslashes are one literal backslash, so
+    the "n" after them is plain text and nothing was collapsed.
     """
     acceptable_shell = [
         "```bash\ngrep 'a\\nb' file.txt\n```",
@@ -868,11 +875,25 @@ def test_the_copy_pasteable_gate_accepts_escapes_the_command_means() -> None:
         '```bash\nprintf "x\\n y"\n```',
         "```bash\nsed -e 's/x\\n y/z/'\n```",
         "```bash\necho 'a\\n b'\n```",
+        "```bash\necho a\\\\nb\n```",
     ]
     for acceptable in acceptable_shell:
         assert not _copy_paste_problems(acceptable), (
             f"valid shell must not be flagged as a collapsed continuation: {acceptable!r}"
         )
+
+
+def test_the_copy_pasteable_gate_still_sees_a_collapse_after_an_escaped_quote() -> None:
+    """An escaped quote outside quotes is a literal quote, not the start of one.
+
+    Shell reads <backslash><quote> as a quote character, so the line does not become
+    quoted and a later unquoted backslash-n is still a collapsed continuation. A
+    walker that let the escaped quote open a quote would go blind to it.
+    """
+    escaped_quote = '```bash\n echo \\"a\\nb\\"\n```'
+    assert _copy_paste_problems(escaped_quote), (
+        "an escaped quote must not hide a later unquoted backslash-n"
+    )
 
 def test_the_copy_pasteable_gate_ignores_non_shell_fences() -> None:
     """A Python or text example may legitimately hold a backslash; only shell is checked."""
