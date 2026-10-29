@@ -182,17 +182,40 @@ def verify(archive: Path, result: dict, workdir: Path) -> list[str]:
         failures.append("the top-level archive directory does not match the run id")
 
     underived = demo_report.evaluate(evidence)
-    for stage, verdict in underived["stages"].items():
-        printed = (result.get("stage_details") or {}).get(stage, {}).get("status")
+    # The task names its own stages, so the verdict has to be scoped to them before it can
+    # be compared with what was printed. A file written for the older fixed stage list
+    # reports stages the task never declared and would flag every one of them as absent.
+    task = manifest.get("task")
+    stage_records = manifest.get("task_stages") or []
+    deferred_id = next(
+        (record["stage_id"] for record in stage_records if record.get("deferred")), None
+    )
+    scoped = (
+        demo_report.scope_verdict(underived, task, stage_records)
+        if task is not None and stage_records
+        else underived
+    )
+    printed_details = result.get("stage_details") or {}
+    for stage, verdict in scoped["stages"].items():
+        printed = (printed_details.get(stage) or {}).get("status")
+        # The archive stage is judged after the bundle is written, so the manifest inside
+        # the archive can only carry the pre-archive value; the printed envelope is where
+        # its verdict exists. Comparing them would fail on every delivered run.
+        if stage == deferred_id:
+            continue
         if verdict["status"] != printed:
-            failures.append(f"stage {stage}: archived evidence says {verdict['status']}, result says {printed}")
+            failures.append(
+                f"stage {stage}: archived evidence says {verdict['status']}, result says {printed}"
+            )
 
-    if manifest.get("overall_status") != underived["overall_status"]:
+    if manifest.get("overall_status") != scoped["overall_status"]:
         failures.append(
             "the archived manifest's overall_status does not match the verdict its own evidence "
             "produces"
         )
-    delivered = demo_report.combine_with_archive(underived, result.get("artifacts_bundle"))
+    delivered = demo_report.combine_with_archive(
+        scoped, result.get("artifacts_bundle"), stage_id=deferred_id
+    )
     if delivered["overall_status"] != result.get("overall_status"):
         failures.append(
             "the delivered verdict does not follow from the archived evidence plus the printed "

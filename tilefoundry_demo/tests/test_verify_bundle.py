@@ -402,3 +402,86 @@ def test_library_records_are_taken_from_the_manifest_not_the_test_results(
     failures = verify_bundle.verify(archive, result, tmp_path / "work2")
     assert not any("no compiled library" in item for item in failures), failures
     assert not any("which no compile record names" in item for item in failures), failures
+
+
+def test_a_task_scoped_bundle_verifies_against_its_own_stage_ids(tmp_path: Path) -> None:
+    """A bundle whose manifest carries the task verifies against the task stage ids.
+
+    The container now writes the spec into the manifest and reports stages under the task
+    own ids. A verifier that still compared the older fixed stage list would report every
+    declared stage as missing and every fixed one as absent, so both directions are checked
+    here: the delivered verdict must be accepted, and a deliberately wrong stage detail must
+    still be rejected.
+    """
+    spec = {
+        "schema_version": 1,
+        "task_id": "square",
+        "gpu": {"type": "H200", "count": 1},
+        "stages": [
+            {"stage_id": "environment", "type": "environment", "params": {}},
+            {
+                "stage_id": "analyze",
+                "type": "hir_analyze",
+                "params": {"source_id": "h200_model", "analyses": ["compute-cost", "memory"]},
+            },
+            {
+                "stage_id": "square",
+                "type": "gpu_test",
+                "params": {"case_id": "upstream_square"},
+            },
+            {"stage_id": "archive", "type": "archive", "params": {}},
+        ],
+        "expected_outcomes": {
+            "environment": {"outcome": "pass", "negative": False},
+            "analyze": {"outcome": "pass", "negative": False},
+            "square": {"outcome": "pass", "negative": False},
+            "archive": {"outcome": "pass", "negative": False},
+        },
+    }
+    stage_records = [
+        {"stage_id": "environment", "type": "environment", "command": None, "executed": True},
+        {"stage_id": "analyze", "type": "hir_analyze", "command": ["tilefoundry"], "executed": True},
+        {"stage_id": "square", "type": "gpu_test", "command": "tests/x.py::t", "executed": True},
+        {
+            "stage_id": "archive",
+            "type": "archive",
+            "command": None,
+            "executed": False,
+            "deferred": True,
+        },
+    ]
+
+    # Build the bundle with the task in its manifest, then re-archive so the verifier sees it.
+    archive = build_bundle(tmp_path)
+    unpacked = _extract_all(archive, tmp_path / "unpacked")
+    manifest = json.loads((unpacked / "manifest.json").read_text())
+    manifest["task"] = spec
+    manifest["task_id"] = "square"
+    manifest["task_stages"] = stage_records
+    (unpacked / "manifest.json").write_text(json.dumps(manifest))
+    archive = _rearchive(unpacked)
+
+    verdict = demo_report.evaluate(EVIDENCE)
+    scoped = demo_report.scope_verdict(verdict, spec, stage_records)
+    bundle_record = {
+        "archive_path": f"runs/{RUN_ID}/{archive.name}",
+        "archive_bytes": archive.stat().st_size,
+        "archive_sha256": verify_bundle.sha256_file(archive),
+    }
+    delivered = demo_report.combine_with_archive(scoped, bundle_record, stage_id="archive")
+    result = printed_result(archive)
+    result["artifacts_bundle"] = bundle_record
+    result["overall_status"] = delivered["overall_status"]
+    result["stage_details"] = delivered["stages"]
+
+    assert set(result["stage_details"]) == {"environment", "analyze", "square", "archive"}
+    assert verify_bundle.verify(archive, result, tmp_path / "work2") == []
+
+    # A claimed pass that the archive evidence does not support must still be caught.
+    result["stage_details"] = {
+        **result["stage_details"],
+        "analyze": {"status": "FAIL", "reason": "injected disagreement"},
+    }
+    failures = verify_bundle.verify(archive, result, tmp_path / "work3")
+    assert any("stage analyze" in failure for failure in failures), failures
+
