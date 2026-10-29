@@ -38,6 +38,7 @@ from demo_report import evaluate, resolve_run_id, reserve_directory, validate_ru
 from demo_build_inputs import assert_dockerfile_unchanged, frozen_image_inputs  # noqa: E402
 from demo_task import (  # noqa: E402
     TaskValidationError,
+    assert_runner_support,
     load_task,
     runner_inventory,
     runner_sha,
@@ -45,14 +46,82 @@ from demo_task import (  # noqa: E402
     validate_task,
 )
 
-DEFAULT_TILEFOUNDRY_REPO = Path(
-    os.environ.get("TILEFOUNDRY_REPO", "/home/shijingchang/workspace/TileFoundry")
-)
 VOLUME_NAME = "tilefoundry-artifacts"
 SOURCE_ROOT = "/opt/tilefoundry"
 GPU_TIMEOUT_SECONDS = 600
 CPU_TIMEOUT_SECONDS = 1800
 GPU_SPEC = "H200"
+#: The directory name a TileFoundry checkout has when it sits beside this repository.
+SIBLING_CHECKOUT_NAME = "TileFoundry"
+#: The environment variable that names the checkout explicitly.
+CHECKOUT_ENV_VAR = "TILEFOUNDRY_REPO"
+#: A checkout is accepted only when it holds this file, which every TileFoundry revision has.
+CHECKOUT_MARKER = "pyproject.toml"
+
+
+class CheckoutNotFound(RuntimeError):
+    """No usable TileFoundry checkout was found, so no image may be built."""
+
+
+def resolve_tilefoundry_repo(
+    explicit: str | Path | None = None, *, demo_root: Path | None = None
+) -> Path:
+    """Locate the TileFoundry checkout to freeze, or explain how to point at one.
+
+    Resolution order, and nothing else:
+
+    1. *explicit*, when the caller passed one (``--tilefoundry-repo``);
+    2. ``$TILEFOUNDRY_REPO``, when it is set and non-empty;
+    3. a ``TileFoundry`` checkout beside this repository, i.e. the sibling of the
+       directory that holds ``tilefoundry_demo/``.
+
+    Nothing here reads the current working directory: every candidate is derived from
+    *demo_root* (this file's parent) or from an explicit value, so running the CLI from
+    another directory cannot change which checkout is frozen.
+
+    Args:
+        explicit: A checkout path the caller named, or None.
+        demo_root: The ``tilefoundry_demo/`` directory. Defaults to this file's parent.
+
+    Returns:
+        The resolved absolute checkout path.
+
+    Raises:
+        CheckoutNotFound: If no candidate holds a ``pyproject.toml``. The message names
+            every place that was tried and how to configure one. No image is built.
+    """
+    root = Path(demo_root) if demo_root is not None else HERE
+    attempts: list[tuple[str, Path]] = []
+    if explicit is not None and str(explicit).strip():
+        attempts.append(("the --tilefoundry-repo argument", Path(explicit).expanduser()))
+    from_environment = os.environ.get(CHECKOUT_ENV_VAR, "").strip()
+    if from_environment:
+        attempts.append((f"${CHECKOUT_ENV_VAR}", Path(from_environment).expanduser()))
+    # "Beside this repository" is the directory that holds this repository, not the one
+    # that holds this package: the documented quick start clones both repositories under a
+    # single workspace directory, so the checkout sits next to the ModalTests root. Measured
+    # from the demo directory that is two levels up.
+    attempts.append(
+        (
+            f"the checkout beside {root.parent.parent}",
+            root.parent.parent / SIBLING_CHECKOUT_NAME,
+        )
+    )
+    for origin, candidate in attempts:
+        resolved = candidate.resolve()
+        if (resolved / CHECKOUT_MARKER).is_file():
+            return resolved
+    tried = "\n".join(f"  - {origin}: {candidate}" for origin, candidate in attempts)
+    raise CheckoutNotFound(
+        "no TileFoundry checkout was found, so no Modal image was built.\n"
+        f"Looked for a directory holding {CHECKOUT_MARKER!r}, in this order:\n{tried}\n"
+        "Fix it by cloning TileFoundry and naming the checkout explicitly:\n"
+        f"  git clone https://github.com/jingchangshi/TileFoundry.git "
+        f"\"$HOME/workspace/{SIBLING_CHECKOUT_NAME}\"\n"
+        f"  export {CHECKOUT_ENV_VAR}=\"$HOME/workspace/{SIBLING_CHECKOUT_NAME}\"\n"
+        "or pass --tilefoundry-repo PATH. The checkout must be a git clone, because the "
+        "snapshot records its commit and its pinned CUTLASS gitlink."
+    )
 
 
 def package_version(snapshot: dict) -> str:
@@ -72,7 +141,12 @@ artifacts = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 if modal.is_local():
     from demo_source import cleanup, prepare
 
-    STAGING, SNAPSHOT, SNAPSHOT_FILES = prepare(DEFAULT_TILEFOUNDRY_REPO)
+    # Resolved once, here, and the resulting directory is what is frozen, digested, and
+    # uploaded. A later path decision in main() could only contradict this snapshot, so
+    # main() re-resolves with the same inputs and refuses a disagreement instead of
+    # building an image from one checkout while the manifest names another.
+    TILEFOUNDRY_REPO = resolve_tilefoundry_repo()
+    STAGING, SNAPSHOT, SNAPSHOT_FILES = prepare(TILEFOUNDRY_REPO)
     SNAPSHOT["package_version"] = package_version(SNAPSHOT)
     # The P0-2 proof: the Dockerfile and the build context come from the same frozen
     # directory as the Python source, so the image cannot be built from one revision while
@@ -126,6 +200,7 @@ if modal.is_local():
         )
     )
 else:
+    TILEFOUNDRY_REPO = None
     STAGING = None
     SNAPSHOT = {}
     SNAPSHOT_FILES = []
@@ -208,7 +283,13 @@ def load_and_validate_task(task: str) -> dict:
             f"task {task!r} resolves outside {tasks_root}; task specs live in tasks/"
         )
     try:
-        return validate_task(load_task(resolved))
+        spec = validate_task(load_task(resolved))
+        # Validating the shape of a spec is not the same as being able to run it. A stage
+        # type or a case that exists in the contract but that this entrypoint has no
+        # executor for must be refused here, before any image build or GPU reservation,
+        # rather than executed partly and reported as a success.
+        assert_runner_support(spec)
+        return spec
     except TaskValidationError as error:
         raise SystemExit(f"task {task} is not acceptable: {error}") from None
 
@@ -217,22 +298,29 @@ def load_and_validate_task(task: str) -> dict:
 def main(
     cpu_only: bool = False,
     run_id: str = "",
-    tilefoundry_repo: str = str(DEFAULT_TILEFOUNDRY_REPO),
+    tilefoundry_repo: str = "",
     task: str = DEFAULT_TASK,
 ) -> None:
     """Freeze the local source, run the container stages, and report their evidence."""
-    global STAGING, SNAPSHOT, SNAPSHOT_FILES
+    global STAGING, SNAPSHOT, SNAPSHOT_FILES, TILEFOUNDRY_REPO
     # Validate the task first: a rejected spec must cost nothing.
     effective_task = load_and_validate_task(task)
     needs_gpu = any(
         stage["type"] in {"gpu_test", "gpu_benchmark"} for stage in effective_task["stages"]
     )
-    repo = Path(tilefoundry_repo)
-    if not (repo / "pyproject.toml").is_file():
-        raise SystemExit(f"not a TileFoundry checkout: {repo}")
-    if Path(tilefoundry_repo) != DEFAULT_TILEFOUNDRY_REPO:
+    # The module already froze a checkout at import time. Re-resolve with this call's own
+    # inputs and require the two to agree: a run must never build an image from one
+    # checkout while its manifest, provenance, and digest describe another.
+    try:
+        requested_repo = resolve_tilefoundry_repo(tilefoundry_repo)
+    except CheckoutNotFound as error:
+        raise SystemExit(str(error)) from None
+    if TILEFOUNDRY_REPO is not None and requested_repo != Path(TILEFOUNDRY_REPO):
         raise SystemExit(
-            "set TILEFOUNDRY_REPO in the environment to point the demo at another checkout"
+            "the frozen snapshot is not from the checkout this command names: "
+            f"frozen {TILEFOUNDRY_REPO}, requested {requested_repo}. The source is frozen when "
+            "the module is imported, so set the path before `modal run`: "
+            f"{CHECKOUT_ENV_VAR}={requested_repo} modal run run_demo.py"
         )
 
     # A caller-supplied id is taken as given and must be safe and free; a generated id is
