@@ -735,12 +735,59 @@ def test_readme_documents_the_cpu_only_completion_scope() -> None:
 # That is a distinct failure mode from a wrong path, so it gets its own gate.
 # ---------------------------------------------------------------------------
 FENCE = "`" * 3
-FENCED_BLOCK = re.compile(FENCE + r"[^\n]*\n(.*?)" + FENCE, re.S)
+FENCED_BLOCK = re.compile(FENCE + r"([^\n]*)\n(.*?)" + FENCE, re.S)
+
+#: Info-string tags whose fenced body is shell. A Python example, a directory tree,
+#: or a quoted error message is not a command anyone pastes, so the backslash rules
+#: below do not describe it and must not be applied to it: a correct Python snippet
+#: containing a "\n" escape is not a broken shell continuation.
+SHELL_FENCE_TAGS = frozenset({"", "bash", "sh", "shell", "console", "zsh"})
 
 
-def _fenced_blocks(text: str) -> list[str]:
-    """Every fenced code block body in a Markdown file."""
-    return FENCED_BLOCK.findall(text)
+def _fenced_blocks(text: str) -> list[tuple[str, str]]:
+    """Every fenced code block as (info-string tag, body), in document order."""
+    return [(tag.strip().lower(), body) for tag, body in FENCED_BLOCK.findall(text)]
+
+
+def _shell_blocks(text: str) -> list[tuple[int, str]]:
+    """(document-order index, body) for each fenced block that holds shell commands.
+
+    The index stays the position among *all* fences, not among shell fences only, so a
+    failure message points at the block a reader counts in the file.
+    """
+    return [
+        (index, body)
+        for index, (tag, body) in enumerate(_fenced_blocks(text))
+        if tag in SHELL_FENCE_TAGS
+    ]
+
+
+#: A collapsed continuation leaves *the two characters* backslash-n where a line
+#: break belongs, so it is followed by the indentation of the line it swallowed.
+#: A backslash-n with non-space on both sides is text the command means, such as
+#: grep 'a\nb' or printf 'x\ny', which are valid shell and must not be flagged.
+COLLAPSED_CONTINUATION = re.compile(r"\\n(?=[ \t])")
+
+
+def _copy_paste_problems(text: str) -> list[str]:
+    """Every way the shell blocks in *text* would break when pasted into a shell."""
+    offenders = []
+    for index, body in _shell_blocks(text):
+        # A collapsed continuation leaves the two characters backslash-n where a
+        # line break used to be, so it is followed by the indentation of the line
+        # it swallowed. A backslash-n with non-space on both sides is text the
+        # command means, such as grep 'a\nb', which is valid shell.
+        for _ in COLLAPSED_CONTINUATION.findall(body):
+            offenders.append(f"block {index}: collapsed line continuation")
+        # A line ending in two backslashes is the double-escaped form: shell reads
+        # the second backslash as an escaped backslash, not a continuation, so the
+        # next line becomes a separate command.
+        for line in body.splitlines():
+            if line.rstrip().endswith("\\\\"):
+                offenders.append(
+                    f"block {index}: doubled line continuation: {line.strip()[:60]}"
+                )
+    return offenders
 
 
 def test_documented_shell_blocks_are_copy_pasteable() -> None:
@@ -750,19 +797,10 @@ def test_documented_shell_blocks_are_copy_pasteable() -> None:
         path = DEMO_ROOT / relative
         if not path.exists():
             continue
-        for index, body in enumerate(_fenced_blocks(path.read_text(encoding="utf-8"))):
-            # A literal backslash-n inside a fence is what a double-escaped
-            # continuation degrades into once the Markdown is rendered.
-            if "\\n" in body:
-                offenders.append(f"{relative} block {index}: literal backslash-n")
-            # A line ending in two backslashes is the double-escaped form: shell
-            # reads the second backslash as an escaped backslash, not a
-            # continuation, so the next line becomes a separate command.
-            for line in body.splitlines():
-                if line.rstrip().endswith("\\\\"):
-                    offenders.append(
-                        f"{relative} block {index}: doubled line continuation: {line.strip()[:60]}"
-                    )
+        offenders += [
+            f"{relative} {problem}"
+            for problem in _copy_paste_problems(path.read_text(encoding="utf-8"))
+        ]
     assert not offenders, (
         "documented shell blocks must be copy-pasteable, so a line continuation is a "
         f"single backslash and never a literal backslash-n: {offenders}"
@@ -772,13 +810,27 @@ def test_documented_shell_blocks_are_copy_pasteable() -> None:
 def test_the_copy_pasteable_gate_catches_the_escaping_bug() -> None:
     """The gate must fail on the shape it exists to catch, not just pass vacuously."""
     doubled = "```bash\nmodal volume get a \\\\n  b \\\\n  c\n```"
-    literal = "```bash\nmodal volume get a " + chr(92) * 2 + "n  b\n```"
-    assert _fenced_blocks(doubled), "the extractor must find a real block"
-    for broken in (doubled, literal):
-        bodies = _fenced_blocks(broken)
-        assert bodies, f"extractor found no block in {broken!r}"
-        caught = any(
-            "\\n" in body or any(line.rstrip().endswith("\\\\") for line in body.splitlines())
-            for body in bodies
+    collapsed = "```bash\nmodal volume get a \\n      b\n```"
+    for broken in (doubled, collapsed):
+        assert _copy_paste_problems(broken), f"the gate would not have caught {broken!r}"
+
+
+def test_the_copy_pasteable_gate_accepts_escapes_the_command_means() -> None:
+    """A real escape, with non-space on both sides, is not a collapsed continuation."""
+    grep_escape = "```bash\ngrep 'a\\nb' file.txt\n```"
+    printf_escape = "```bash\nprintf 'x\\ny'\n```"
+    for acceptable in (grep_escape, printf_escape):
+        assert not _copy_paste_problems(acceptable), (
+            f"valid shell must not be flagged as a collapsed continuation: {acceptable!r}"
         )
-        assert caught, f"the gate would not have caught {broken!r}"
+
+
+def test_the_copy_pasteable_gate_ignores_non_shell_fences() -> None:
+    """A Python or text example may legitimately hold a backslash; only shell is checked."""
+    pythonish = "```python\nprint(\"a\\nb\")\n```"
+    textish = "```text\nline1\\nline2\n```"
+    assert _shell_blocks(pythonish) == [], "a Python example is not a shell command"
+    assert _shell_blocks(textish) == [], "a text example is not a shell command"
+    assert _fenced_blocks(pythonish)[0][0] == "python"
+    assert not _copy_paste_problems(pythonish), "a Python example is not a shell command"
+    assert not _copy_paste_problems(textish), "a text example is not a shell command"
