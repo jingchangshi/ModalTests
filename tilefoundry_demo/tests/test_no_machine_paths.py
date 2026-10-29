@@ -843,21 +843,41 @@ def test_documented_shell_blocks_are_copy_pasteable() -> None:
     )
 
 
-def test_the_copy_pasteable_gate_catches_the_escaping_bug() -> None:
-    """The gate must fail on the shapes it exists to catch, not pass vacuously.
+def _rule_names(problems: list[str]) -> list[str]:
+    """The rule each reported problem came from, e.g. 'doubled line continuation'."""
+    return [problem.split(": ", 1)[1].split(": ")[0] for problem in problems]
 
-    The doubled form is the one the real defect had, and it needs a real newline
-    after the two backslashes: that is what made the historical README four lines
-    ending in a doubled backslash. A fixture without the newline is an escaped
-    backslash followed by a letter, which is valid shell, so the shape is pinned
-    here exactly as the archive carries it.
+
+def test_the_copy_pasteable_gate_catches_the_escaping_bug() -> None:
+    """Each must-flag fixture must trip the specific rule it exists to exercise.
+
+    Asserting only that a fixture is caught is not enough, because a fixture can be
+    caught by the wrong rule. That is how the doubled rule lost its only test: a
+    two-backslash fixture with no newline was reported as a collapsed continuation,
+    so the suite stayed green while the doubled rule, the branch the historical
+    regression actually anchors, went unexercised.
+
+    So the doubled fixture needs a real newline after the two backslashes, which is
+    the shape the archive carries, while the collapsed fixtures need a literal
+    backslash-n. The expected rule is asserted per fixture rather than assumed.
     """
     doubled = "```bash\nmodal volume get a \\\\\n  b\\\\\n  c\n```"
     collapsed_indented = "```bash\nmodal volume get a \\n      b\n```"
     collapsed_unindented = "```bash\nmodal volume get a \\narg\n```"
-    for broken in (doubled, collapsed_indented, collapsed_unindented):
-        assert _copy_paste_problems(broken), f"the gate would not have caught {broken!r}"
-
+    expected = {
+        doubled: ["doubled line continuation", "doubled line continuation"],
+        collapsed_indented: ["collapsed line continuation"],
+        collapsed_unindented: ["collapsed line continuation"],
+    }
+    for fixture, rules in expected.items():
+        got = _rule_names(_copy_paste_problems(fixture))
+        assert got == rules, f"{fixture!r} must be caught by {rules}, not by {got}"
+    # Both rules have to be exercised, or one of them can silently lose its fixture
+    # while every remaining fixture keeps passing for the wrong reason.
+    exercised = {rule for rules in expected.values() for rule in rules}
+    assert exercised == {"doubled line continuation", "collapsed line continuation"}, (
+        f"the fixtures must exercise both rules, got {sorted(exercised)}"
+    )
 
 def test_the_copy_pasteable_gate_accepts_escapes_the_command_means() -> None:
     """A quoted backslash-n is an escape the command means, whatever follows it.
