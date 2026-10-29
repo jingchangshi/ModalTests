@@ -762,22 +762,53 @@ def _shell_blocks(text: str) -> list[tuple[int, str]]:
     ]
 
 
-#: A collapsed continuation leaves *the two characters* backslash-n where a line
-#: break belongs, so it is followed by the indentation of the line it swallowed.
-#: A backslash-n with non-space on both sides is text the command means, such as
-#: grep 'a\nb' or printf 'x\ny', which are valid shell and must not be flagged.
-COLLAPSED_CONTINUATION = re.compile(r"\\n(?=[ \t])")
+def _unquoted_backslash_n(body: str) -> list[int]:
+    """Offsets where a literal backslash-n sits *outside* shell quoting.
+
+    The discriminator is quoting, not what follows the escape. A collapsed
+    continuation is a line break that lost its newline, and a line break lives
+    outside quotes, so a collapse always lands unquoted. A backslash-n the command
+    means sits inside single or double quotes -- grep 'a\nb', printf 'a\n b' -- and
+    is valid shell however its surroundings read.
+
+    A plain "backslash-n followed by a space" rule is wrong in both directions: it
+    flags the valid 'a\n b' and misses the collapse whose swallowed line began at
+    column zero, as in 'cmd\narg'.
+    """
+    offsets = []
+    quote = None
+    index = 0
+    while index < len(body):
+        char = body[index]
+        if quote is None:
+            if char in ("'", '"'):
+                quote = char
+                index += 1
+            elif char == "\\" and body[index + 1 : index + 2] == "n":
+                offsets.append(index)
+                index += 2
+            else:
+                index += 1
+        elif quote == "'":
+            # Nothing is escaped inside single quotes; the next quote closes them.
+            if char == quote:
+                quote = None
+            index += 1
+        else:
+            # Inside double quotes a backslash escapes the next character.
+            index += 2 if char == "\\" else 1
+            if char == '"':
+                quote = None
+    return offsets
 
 
 def _copy_paste_problems(text: str) -> list[str]:
     """Every way the shell blocks in *text* would break when pasted into a shell."""
     offenders = []
     for index, body in _shell_blocks(text):
-        # A collapsed continuation leaves the two characters backslash-n where a
-        # line break used to be, so it is followed by the indentation of the line
-        # it swallowed. A backslash-n with non-space on both sides is text the
-        # command means, such as grep 'a\nb', which is valid shell.
-        for _ in COLLAPSED_CONTINUATION.findall(body):
+        # Every shell block here is a flat command line, so a backslash-n outside
+        # quotes can only be a line break that lost its newline.
+        for _ in _unquoted_backslash_n(body):
             offenders.append(f"block {index}: collapsed line continuation")
         # A line ending in two backslashes is the double-escaped form: shell reads
         # the second backslash as an escaped backslash, not a continuation, so the
@@ -808,22 +839,40 @@ def test_documented_shell_blocks_are_copy_pasteable() -> None:
 
 
 def test_the_copy_pasteable_gate_catches_the_escaping_bug() -> None:
-    """The gate must fail on the shape it exists to catch, not just pass vacuously."""
+    """The gate must fail on the shapes it exists to catch, not pass vacuously.
+
+    The doubled form is the one the real defect had: the historical README carried
+    four lines ending in two backslashes and zero collapsed escapes, so that shape is
+    anchored by an actual regression. The collapsed form is pinned by its
+    discriminating variants, including the one a "followed by a space" rule misses: a
+    swallowed line that began at column zero.
+    """
     doubled = "```bash\nmodal volume get a \\\\n  b \\\\n  c\n```"
-    collapsed = "```bash\nmodal volume get a \\n      b\n```"
-    for broken in (doubled, collapsed):
+    collapsed_indented = "```bash\nmodal volume get a \\n      b\n```"
+    collapsed_unindented = "```bash\nmodal volume get a \\narg\n```"
+    for broken in (doubled, collapsed_indented, collapsed_unindented):
         assert _copy_paste_problems(broken), f"the gate would not have caught {broken!r}"
 
 
 def test_the_copy_pasteable_gate_accepts_escapes_the_command_means() -> None:
-    """A real escape, with non-space on both sides, is not a collapsed continuation."""
-    grep_escape = "```bash\ngrep 'a\\nb' file.txt\n```"
-    printf_escape = "```bash\nprintf 'x\\ny'\n```"
-    for acceptable in (grep_escape, printf_escape):
+    """A quoted backslash-n is an escape the command means, whatever follows it.
+
+    Both quote styles and both following characters are covered, because the rule this
+    replaced keyed off what came after the escape: an escape followed by a space is
+    ordinary, valid shell and must not be reported as a lost line break.
+    """
+    acceptable_shell = [
+        "```bash\ngrep 'a\\nb' file.txt\n```",
+        "```bash\nprintf 'x\\ny'\n```",
+        "```bash\nprintf 'a\\n b'\n```",
+        '```bash\nprintf "x\\n y"\n```',
+        "```bash\nsed -e 's/x\\n y/z/'\n```",
+        "```bash\necho 'a\\n b'\n```",
+    ]
+    for acceptable in acceptable_shell:
         assert not _copy_paste_problems(acceptable), (
             f"valid shell must not be flagged as a collapsed continuation: {acceptable!r}"
         )
-
 
 def test_the_copy_pasteable_gate_ignores_non_shell_fences() -> None:
     """A Python or text example may legitimately hold a backslash; only shell is checked."""
