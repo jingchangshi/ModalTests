@@ -431,18 +431,30 @@ def evaluate(evidence: dict) -> dict:
     }
 
 
-def combine_with_archive(verdict: dict, archive: dict | None) -> dict:
+def combine_with_archive(
+    verdict: dict, archive: dict | None, *, stage_id: str = "archive"
+) -> dict:
     """Fold the archive verdict into a delivered-run verdict.
 
     A run whose evidence never reached the Volume cannot be delivered as a
     success, so the archive failure outranks a passing execution.
+
+    Args:
+        verdict: The verdict covering every stage that ran.
+        archive: The bundle record, or None when archiving never happened.
+        stage_id: The task's own id for its archive stage. A task names its stages, so
+            writing the result under a fixed key would either duplicate the stage or drop
+            it from the scoped verdict.
     """
     status, reason = evaluate_archive(archive)
     overall = _worst([verdict["overall_status"], status])
-    reasons = [] if overall == STATUS_PASS else [f"archive: {reason}" if status != STATUS_PASS else verdict["overall_reason"]]
+    reasons = [] if overall == STATUS_PASS else [f"{stage_id}: {reason}" if status != STATUS_PASS else verdict["overall_reason"]]
+    stages = verdict["stages"]
+    if stage_id is not None:
+        stages = {**stages, stage_id: {"status": status, "reason": reason}}
     return {
         **verdict,
-        "stages": {**verdict["stages"], "archive": {"status": status, "reason": reason}},
+        "stages": stages,
         "overall_status": overall,
         "overall_reason": "; ".join(reasons) if reasons else verdict["overall_reason"],
     }
@@ -528,6 +540,120 @@ def resolve_run_id(root: Path, candidate: str, *, attempts: int = 1000) -> str:
         if not (Path(root) / suffixed).exists():
             return suffixed
     raise RuntimeError(f"run id {candidate!r}: no free suffix after {attempts} attempts")
+
+
+def scope_verdict(
+    verdict: dict,
+    spec: dict,
+    stage_records: list[dict],
+    *,
+    fulfilled: dict[str, str] | None = None,
+) -> dict:
+    """Report exactly the task's stages, and judge each by the observation it produced.
+
+    :func:`evaluate` judges a fixed list of stages covering the whole GPU demo. A task may
+    declare fewer stages than that, or a stage this invocation is not permitted to run. Both
+    cases make a fixed list wrong in opposite directions: an undeclared stage would drag the
+    overall verdict down for work nobody asked for, and an unexecuted stage would be reported
+    as a pass it never earned.
+
+    So the verdict is rebuilt from the task:
+
+    * a stage that ran keeps the status its own observation produced;
+    * a stage that did not run is ``NOT_RUN`` with the recorded reason;
+    * a stage with no recorded reason and no observation is ``ERROR``, because that is a
+      runner gap rather than a clean skip.
+
+    Args:
+        verdict: The fixed-list verdict from :func:`evaluate`.
+        spec: The validated task spec the run executed.
+        stage_records: One record per stage, in execution order.
+        fulfilled: Observation name -> the stage id that produced it.
+
+    Returns:
+        The same envelope shape :func:`evaluate` returns, scoped to the task.
+    """
+    fulfilled = fulfilled or {}
+    by_observation = {stage_id: name for name, stage_id in fulfilled.items()}
+    judged = verdict.get("stages") or {}
+    scoped: dict[str, dict] = {}
+    for record in stage_records:
+        stage_id = record["stage_id"]
+        stage_type = record.get("type")
+        if record.get("deferred"):
+            # The archive stage is judged by :func:`combine_with_archive` after it runs.
+            scoped[stage_id] = {
+                "status": STATUS_NOT_RUN,
+                "reason": "the archive stage has not been judged yet",
+            }
+            continue
+        if not record.get("executed"):
+            scoped[stage_id] = {
+                "status": STATUS_NOT_RUN,
+                "reason": record.get("skipped_reason") or "the stage was declared but never ran",
+            }
+            continue
+        observation = _observation_for(stage_type, by_observation)
+        if observation is None:
+            scoped[stage_id] = {
+                "status": STATUS_ERROR,
+                "reason": f"the {stage_type!r} stage ran but produced no judgement",
+            }
+            continue
+        scoped[stage_id] = dict(judged[observation])
+    # A deferred stage is excluded: it has not been judged yet, so ranking it now would
+    # report a gap that :func:`combine_with_archive` is about to fill. ``_worst`` is used
+    # directly because the fixed-list ``reduce_overall`` adds its own NOT_RUN whenever the
+    # pytest return code is absent, which would reintroduce the same false gap.
+    statuses = [entry["status"] for entry in scoped.values() if entry["status"] != STATUS_NOT_RUN]
+    overall = _worst(statuses or [STATUS_NOT_RUN])
+    deferred = {record["stage_id"] for record in stage_records if record.get("deferred")}
+    # A deferred stage is left out of the reason for the same reason it is left out of the
+    # ranking: its verdict does not exist yet, so naming it would describe a gap that
+    # combine_with_archive is about to close.
+    reasons = [
+        f"{stage_id}: {entry['reason']}"
+        for stage_id, entry in scoped.items()
+        if entry["status"] != STATUS_PASS and stage_id not in deferred
+    ]
+    # The legacy per-observation keys are derived from the task stages, not inherited from
+    # the fixed list. A CPU-only task therefore reports compile/execution/correctness as
+    # NOT_RUN instead of borrowing a judgment about work it never asked for.
+    summary = {key: value for key, value in verdict.items() if key not in {"stages", "overall_status", "overall_reason"}}
+    for key, stage_type in (
+        ("environment_status", "environment"),
+        ("analysis_status", "hir_analyze"),
+        ("check_status", "hir_check"),
+        ("compile_status", "gpu_test"),
+        ("execution_status", "gpu_test"),
+        ("correctness_status", "gpu_test"),
+    ):
+        matching = [
+            entry
+            for record, entry in zip(stage_records, scoped.values())
+            if record.get("type") == stage_type
+        ]
+        summary[key] = matching[0]["status"] if matching else STATUS_NOT_RUN
+    return {
+        **summary,
+        "stages": scoped,
+        "overall_status": overall,
+        "overall_reason": "; ".join(reasons) if reasons else "every executed stage passed on recorded evidence",
+    }
+
+
+def _observation_for(stage_type: str, by_observation: dict[str, str]) -> str | None:
+    """Return the fixed-list stage name one task stage type is judged by."""
+    preferred = {
+        "environment": ("environment",),
+        "hir_analyze": ("analysis",),
+        "hir_check": ("check",),
+        "gpu_test": ("pytest", "correctness", "compile", "execution", "gpu"),
+    }.get(stage_type, ())
+    for name in preferred:
+        if any(value == name for value in by_observation.values()):
+            return name
+    return preferred[0] if preferred else None
 
 
 def evaluate_stage(record: dict, expected: dict) -> tuple[str, str]:

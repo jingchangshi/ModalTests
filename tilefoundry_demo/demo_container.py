@@ -21,7 +21,9 @@ import tarfile
 import time
 from pathlib import Path
 
+import demo_task
 from demo_provenance import check_provenance
+from demo_task import GPU_STAGE_TYPES, stage_command
 from demo_report import (
     PHASE_POST_EXECUTION,
     PHASE_POST_IMAGE_BUILD,
@@ -30,6 +32,7 @@ from demo_report import (
     inventory,
     inventory_delta,
     parse_junit,
+    scope_verdict,
     sha256_file,
     write_json,
 )
@@ -37,10 +40,16 @@ from demo_report import (
 EVIDENCE_FILE = "test-results.json"
 MANIFEST_FILE = "manifest.json"
 ANALYSIS_REPORT = "analysis.json"
-ANALYSIS_SOURCE = "tests/nvidia/cuda/fixtures/cli/products/h200_sxm.py:Model"
-TEST_TARGET = "tests/nvidia/cuda/integration/test_tir_control_flow.py::test_for_if_square_matches_torch"
+CHECK_REPORT = "check.json"
 TARGET_NAME = "nvidia.h200_sxm"
 BUILD_PREFIX = "tilefoundry_build_"
+
+#: Stage ids this runner maps onto the fixed container machinery. ``environment`` and
+#: ``archive` are the orchestrator's own in-process stages; the other three each run one
+#: subprocess. A stage id outside this map is refused rather than silently skipped, which is
+#: what makes the manifest's per-stage verdicts name only work that actually ran.
+STAGE_ENVIRONMENT = "environment"
+STAGE_ARCHIVE = "archive"
 
 
 def _run_command(command: list[str], *, cwd: Path, log: Path, env: dict | None = None) -> int:
@@ -206,25 +215,74 @@ def collect_environment(source_root: Path, log: Path) -> dict:
     return environment
 
 
-def run_analysis(source_root: Path, results_dir: Path, logs_dir: Path) -> dict:
-    """Run the shipped HIR analysis and read back the JSON it wrote."""
-    report = results_dir / ANALYSIS_REPORT
-    returncode = _run_command(
-        [
-            sys.executable,
-            "-m",
-            "tilefoundry.cli",
-            "analyze",
-            ANALYSIS_SOURCE,
-            str(report),
-            "--compute-cost",
-            "--memory",
-            "--json",
-        ],
-        cwd=source_root,
-        log=logs_dir / "analysis.log",
+def run_check(source_root: Path, results_dir: Path, logs_dir: Path, *, argv: list[str]) -> dict:
+    """Run one ``hir_check`` stage and read back the JSON report it wrote.
+
+    The check executes on CPU by design: it compares a program's outputs against a
+    reference, and a CPU run is enough to prove the comparison itself is exercised.
+    """
+    report = results_dir / CHECK_REPORT
+    command = [*argv[:3], *argv[4:-2], str(report)]
+    returncode = _run_command(command, cwd=source_root, log=logs_dir / "check.log")
+    check: dict = {
+        "returncode": returncode,
+        "command": argv[2],
+        "argv": command,
+        "log": "logs/check.log",
+    }
+    try:
+        payload = json.loads(report.read_text(encoding="utf-8"))
+    except Exception as error:  # noqa: BLE001 - a missing report is the observation
+        check.update({"json_ok": False, "json_error": f"{type(error).__name__}: {error}"})
+        return check
+    runs = payload.get("runs") or ()
+    outputs = [output for run in runs for output in (run.get("outputs") or ())]
+    check.update(
+        {
+            "json_ok": True,
+            "passed": payload.get("passed"),
+            "run_count": len(runs),
+            "output_count": len(outputs),
+            "predicates": [
+                {"out": output.get("path"), "fn": predicate.get("fn"), "passed": predicate.get("passed")}
+                for output in outputs
+                for predicate in (output.get("fns") or ())
+            ],
+        }
     )
-    analysis: dict = {"returncode": returncode, "command": ANALYSIS_SOURCE, "log": "logs/analysis.log"}
+    return check
+
+
+def run_analysis(
+    source_root: Path,
+    results_dir: Path,
+    logs_dir: Path,
+    *,
+    argv: list[str],
+    analyses: list[str],
+) -> dict:
+    """Run one ``hir_analyze`` stage and read back the JSON it wrote.
+
+    The argv is built by :func:`demo_task.stage_command` from the validated task, so the
+    command this stage records is the command the task asked for. Nothing here chooses a
+    source: the previous version hardcoded one, which let a task declare source A while the
+    container analyzed B.
+    """
+    report = results_dir / ANALYSIS_REPORT
+    # The argv is [cli, "analyze", source, <report path>, *flags]; the report path is the
+    # only element this stage relocates, so the flags the task asked for are preserved
+    # verbatim and in order.
+    command = [*argv[:3], str(report), *argv[4:]]
+    returncode = _run_command(command, cwd=source_root, log=logs_dir / "analysis.log")
+    analysis: dict = {
+        "returncode": returncode,
+        # The selector recorded is the one that ran, taken from the argv rather than
+        # recomputed: a second derivation could disagree with what was executed.
+        "command": argv[2],
+        "analyses": list(analyses),
+        "argv": command,
+        "log": "logs/analysis.log",
+    }
     try:
         payload = json.loads(report.read_text(encoding="utf-8"))
     except Exception as error:  # noqa: BLE001 - a missing report is the observation
@@ -304,8 +362,20 @@ def _compiled_arch(build_dir: Path) -> str | None:
     return None
 
 
-def run_test(source_root: Path, results_dir: Path, logs_dir: Path, dump_root: Path) -> dict:
-    """Run the upstream TIR integration test with only the observing plugin added."""
+def run_test(
+    source_root: Path,
+    results_dir: Path,
+    logs_dir: Path,
+    dump_root: Path,
+    *,
+    node_id: str,
+) -> dict:
+    """Run the one registered GPU test the task named, adding only the observing plugin.
+
+    *node_id* comes from the case registry through the validated task, so the pytest node
+    this stage runs is the node the task declared. The previous version used a module
+    constant, which meant a task could name one case while the container ran another.
+    """
     evidence_path = results_dir / EVIDENCE_FILE
     junit = results_dir / "junit.xml"
     build_root = Path(os.environ["TILEFOUNDRY_DEMO_BUILD_ROOT"])
@@ -329,7 +399,7 @@ def run_test(source_root: Path, results_dir: Path, logs_dir: Path, dump_root: Pa
             sys.executable,
             "-m",
             "pytest",
-            TEST_TARGET,
+            node_id,
             "-v",
             "-s",
             "-rs",
@@ -377,7 +447,7 @@ def run_test(source_root: Path, results_dir: Path, logs_dir: Path, dump_root: Pa
             "returncode": returncode,
             "elapsed_seconds": round(elapsed, 3),
             "junit": junit_summary,
-            "command": TEST_TARGET,
+            "command": node_id,
         },
         "compile": compile_evidence,
         "execution": observed.get("execution") or {},
@@ -516,12 +586,19 @@ def run(source_root: Path, payload: dict) -> dict:
     return _run(payload, source_root)
 
 
-def _run(payload: dict, source_root: Path) -> dict:
-    """Run every container stage, archive what it observed, and return the manifest."""
+def _run(payload: dict, source_root: Path, *, allow_gpu: bool = True) -> dict:
+    """Execute the task's stages in order, archive what they observed, and return the manifest.
+
+    The stage list, each stage's parameters, and each stage's expected outcome come from the
+    validated task in *payload*. A stage the runner cannot execute is refused before this
+    function runs; a stage this invocation is not allowed to execute (*allow_gpu* false) is
+    recorded as ``NOT_RUN`` with that reason and can never be reported as ``PASS``.
+    """
     volume_root = Path(os.environ.get("TILEFOUNDRY_DEMO_VOLUME", "/artifacts"))
     run_id = payload["run_id"]
     expected_inventory = payload.get("inventory") or []
     snapshot = payload["snapshot"]
+    spec = payload["task"]
 
     root = Path("/tmp/tilefoundry-demo") / run_id
     results_dir = root / "results"
@@ -536,6 +613,7 @@ def _run(payload: dict, source_root: Path) -> dict:
         "preflight_returncode": None,
         "environment": None,
         "analysis": None,
+        "check": None,
         "compile": None,
         "execution": None,
         "correctness": None,
@@ -543,6 +621,9 @@ def _run(payload: dict, source_root: Path) -> dict:
     }
     source_check: dict = {}
     exception_text: str | None = None
+    stage_records: list[dict] = []
+    # Which stage each observation came from, so the per-stage verdicts name real work.
+    fulfilled: dict[str, str] = {}
 
     try:
         source_check[PHASE_POST_IMAGE_BUILD] = inventory_delta(expected_inventory, inventory(source_root))
@@ -550,16 +631,65 @@ def _run(payload: dict, source_root: Path) -> dict:
         evidence["environment"] = environment
         evidence["preflight_returncode"] = 0 if environment.get("imports_ok") else 1
         if evidence["preflight_returncode"] == 0:
-            evidence["analysis"] = run_analysis(source_root, results_dir, logs_dir)
-            observed = run_test(source_root, results_dir, logs_dir, dump_root)
-            evidence.update(
-                {
-                    "pytest": observed["pytest"],
-                    "compile": observed["compile"],
-                    "execution": observed["execution"],
-                    "correctness": observed["correctness"],
+            for stage in spec["stages"]:
+                stage_type = stage["type"]
+                stage_id = stage["stage_id"]
+                record: dict = {
+                    "stage_id": stage_id,
+                    "type": stage_type,
+                    "command": None,
+                    "executed": False,
                 }
-            )
+                if stage_type == STAGE_ENVIRONMENT:
+                    record.update(executed=True, command=None)
+                elif stage_type == STAGE_ARCHIVE:
+                    # Filled in by the archive step below, which cannot run until every other
+                    # stage has written its evidence.
+                    record.update(executed=False, deferred=True)
+                elif stage_type in GPU_STAGE_TYPES and not allow_gpu:
+                    record["skipped_reason"] = (
+                        "this invocation does not allocate a GPU, so a device stage was not run"
+                    )
+                elif stage_type == "hir_analyze":
+                    argv = stage_command(stage, {"report_dir": results_dir, "inputs": {}})
+                    record["command"] = argv
+                    evidence["analysis"] = run_analysis(
+                        source_root,
+                        results_dir,
+                        logs_dir,
+                        argv=argv,
+                        analyses=stage["params"]["analyses"],
+                    )
+                    record["executed"] = True
+                    fulfilled.setdefault("analysis", stage_id)
+                elif stage_type == "hir_check":
+                    argv = stage_command(stage, {"report_dir": results_dir, "inputs": {}})
+                    record["command"] = argv
+                    evidence["check"] = run_check(
+                        source_root, results_dir, logs_dir, argv=argv
+                    )
+                    record["executed"] = True
+                    fulfilled.setdefault("check", stage_id)
+                elif stage_type == "gpu_test":
+                    node_id = demo_task.CASE_REGISTRY[stage["params"]["case_id"]]["node_id"]
+                    observed = run_test(
+                        source_root, results_dir, logs_dir, dump_root, node_id=node_id
+                    )
+                    evidence.update(
+                        {
+                            "pytest": observed["pytest"],
+                            "compile": observed["compile"],
+                            "execution": observed["execution"],
+                            "correctness": observed["correctness"],
+                        }
+                    )
+                    record.update(executed=True, command=node_id)
+                    fulfilled.setdefault("compile", stage_id)
+                    fulfilled.setdefault("execution", stage_id)
+                    fulfilled.setdefault("correctness", stage_id)
+                    fulfilled.setdefault("pytest", stage_id)
+                    fulfilled.setdefault("gpu", stage_id)
+                stage_records.append(record)
         source_check[PHASE_POST_EXECUTION] = inventory_delta(expected_inventory, inventory(source_root))
     except BaseException as error:  # noqa: BLE001 - a crash is evidence, not a silent abort
         exception_text = f"{type(error).__name__}: {error}\n\n{_tail(logs_dir / 'compile-and-test.log')}"
@@ -571,7 +701,11 @@ def _run(payload: dict, source_root: Path) -> dict:
         # install alone; this judgement also covers whether execution changed the tree.
         evidence["environment"].pop("preflight_only", None)
         judge_provenance(evidence["environment"], source_root)
-    statuses = evaluate(evidence)
+    # Reduce only the observations a stage actually produced. ``evaluate`` judges a fixed
+    # list of stages; ``scope_verdict`` then reports exactly the task's stages, so a stage
+    # this invocation did not run is ``NOT_RUN`` rather than an inherited failure, and a
+    # stage that ran is judged by the observation it produced.
+    statuses = scope_verdict(evaluate(evidence), spec, stage_records, fulfilled=fulfilled)
     elapsed = round(time.monotonic() - started, 3)
     environment = evidence["environment"] or {}
 
@@ -597,8 +731,18 @@ def _run(payload: dict, source_root: Path) -> dict:
         "tilefoundry_version": environment.get("tilefoundry_version"),
         "tilefoundry_nvidia_version": environment.get("tilefoundry_nvidia_version"),
         "pytest_returncode": (evidence["pytest"] or {}).get("returncode"),
-        "analysis_command": ANALYSIS_SOURCE,
-        "test_command": TEST_TARGET,
+        "task_id": spec["task_id"],
+        # The spec itself travels with the evidence, so a reader can re-derive the declared
+        # stages from the archive alone instead of trusting the printed envelope. This is
+        # what lets verify_bundle.py scope its verdict to the task that actually ran.
+        "task": spec,
+        "task_spec_sha": payload.get("task_spec_sha"),
+        "runner_sha": payload.get("runner_sha"),
+        "completion_scope": payload.get("completion_scope"),
+        "task_stages": stage_records,
+        "analysis_command": (evidence["analysis"] or {}).get("command"),
+        "check_command": (evidence["check"] or {}).get("command"),
+        "test_command": (evidence["pytest"] or {}).get("command"),
         "elapsed_seconds": elapsed,
         "test_elapsed_seconds": (evidence["pytest"] or {}).get("elapsed_seconds"),
         "exception": exception_text,
@@ -635,11 +779,23 @@ def _run(payload: dict, source_root: Path) -> dict:
     except BaseException as error:  # noqa: BLE001
         bundle = {"error": f"{type(error).__name__}: {error}"}
 
-    final = combine_with_archive(statuses, bundle)
+    # The archive stage's id comes from the task, because the task names its stages. A task
+    # that declares no archive stage must not have one invented in the manifest.
+    archive_stage = next(
+        (record["stage_id"] for record in stage_records if record.get("deferred")), None
+    )
+    final = (
+        combine_with_archive(statuses, bundle, stage_id=archive_stage)
+        if archive_stage is not None
+        else combine_with_archive(statuses, bundle, stage_id=None)
+    )
     manifest["artifacts_bundle"] = bundle
     manifest["overall_status"] = final["overall_status"]
     manifest["overall_reason"] = final["overall_reason"]
-    manifest["stage_details"] = statuses["stages"]
+    # The archive verdict belongs in the per-stage detail, and it now exists. Writing the
+    # pre-archive statuses here would leave "the archive stage has not been judged yet" in
+    # a manifest whose archive succeeded, which reads as a gap that is not there.
+    manifest["stage_details"] = final["stages"]
     manifest["notes"]["archive_verdict"] = (
         "the manifest inside the archive states the verdict of the executed stages, because it "
         "was written before the archive existed; the returned envelope adds the archive verdict "

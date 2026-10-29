@@ -67,41 +67,54 @@ NEGATIVE_CAPABLE = frozenset({"hir_analyze", "hir_check", "gpu_test"})
 
 ANALYSES = frozenset({"compute-cost", "memory", "roofline"})
 
-#: Registered sources. Each entry is a repository-relative selector plus its capabilities.
-#: A task names a key; it cannot supply a module path.
+#: Registered sources. Each entry is a repository-relative path plus the selector the
+#: TileFoundry CLI needs for it. A task names a key; it cannot supply a module path.
+#:
+#: Only sources that the shipped CLI actually reads are listed. ``fixtures/tir/square.py``
+#: is an authored-TIR twin, not an analyzable HIR module: ``tilefoundry analyze`` raises
+#: ``AttributeError: 'PrimFunction' object has no attribute 'return_type'`` on it, so
+#: registering it made the analyze stage fail on every run.
 SOURCE_REGISTRY: dict[str, dict] = {
     "h200_model": {
         "path": "tests/nvidia/cuda/fixtures/cli/products/h200_sxm.py",
-        "cpu_capable": True,
-        "target": "nvidia.h200_sxm",
-    },
-    "square_hir": {
-        "path": "tests/nvidia/cuda/fixtures/tir/square.py",
+        "selector": "Model",
         "cpu_capable": True,
         "target": "nvidia.h200_sxm",
     },
 }
 
 #: Registered cases. ``node_id`` is the fixed test the demo runs; there is no way to pass
-#: pytest options through a task.
+#: pytest options through a task. ``runner`` names the driver that executes the case, so a
+#: case belonging to another driver is refused before a GPU is requested rather than
+#: silently skipped.
 CASE_REGISTRY: dict[str, dict] = {
     "upstream_square": {
-        "node_id": "tests/nvidia/cuda/integration/test_square.py::test_square",
+        "node_id": "tests/nvidia/cuda/integration/test_tir_control_flow.py::test_for_if_square_matches_torch",
+        "runner": "run_demo",
         "negative": False,
-        "dimensions": {"n": 1024},
+        "dimensions": {},
     },
     "rmsnorm_fp8": {
         "node_id": "cases/rmsnorm_fp8/rms_norm_quant.py::RmsNormQuant",
+        "runner": "run_experiments",
         "negative": False,
         "dimensions": {},
     },
     "rmsnorm_fp8_wrong": {
         "node_id": "cases/rmsnorm_fp8/rms_norm_quant.py::Wrong",
+        "runner": "run_experiments",
         "negative": True,
         "dimensions": {},
         "diagnostic_substrings": ["mismatched"],
     },
 }
+
+#: The stage types ``run_demo`` can execute today. ``gpu_benchmark`` has no executor, so a
+#: task that names it is refused before any remote call instead of being reported as run.
+RUNNER_STAGE_TYPES = frozenset({"environment", "hir_analyze", "hir_check", "gpu_test", "archive"})
+
+#: The driver that executes the stages of a task built for this runner.
+RUNNER_NAME = "run_demo"
 
 #: Predicate bounds each comparison function requires and permits.
 PREDICATE_BOUNDS = {
@@ -136,6 +149,10 @@ CEILINGS = {
 ARCHIVE_RESERVE_SECONDS = 30
 
 ARTIFACT_CATEGORIES = frozenset({"logs", "results", "generated"})
+
+#: The CLI entry point every stage argv is built from. The image installs the snapshot
+#: editable, which puts the ``tilefoundry`` console script on ``PATH``.
+_CLI = ("tilefoundry",)
 
 DEFAULT_ARTIFACTS = {"include": ["logs", "results", "generated"], "required": []}
 
@@ -828,23 +845,26 @@ def stage_command(stage: dict, context: dict) -> list[str] | None:
         return None
 
     if stage_type == "hir_analyze":
-        source = SOURCE_REGISTRY[params["source_id"]]["path"]
-        argv = ["tilefoundry", "analyze", source, str(report_dir / "analysis.json"), "--json"]
+        source = _source_selector(params["source_id"])
+        argv = [*_CLI, "analyze", source, str(report_dir / "analysis.json"), "--json"]
+        # The CLI spells each analysis as its own flag (--compute-cost, --memory,
+        # --roofline). A single ``--analysis NAME`` option does not exist, so the previous
+        # form was a usage error even before the source was reached.
         for analysis in params["analyses"]:
-            argv.extend(["--analysis", analysis])
+            argv.append(f"--{analysis}")
         for name, size in sorted(params["dims"].items()):
             argv.extend(["--dim", f"{name}={size}"])
         return argv
 
     if stage_type == "hir_check":
-        source = SOURCE_REGISTRY[params["source_id"]]["path"]
-        argv = ["tilefoundry", "check", source, "--device", "cpu"]
+        source = _source_selector(params["source_id"])
+        argv = [*_CLI, "check", source, "--device", "cpu"]
         if params["input_ids"]:
             paths = [context["inputs"][input_id] for input_id in params["input_ids"]]
             argv.extend(["--inputs", "files:" + ",".join(paths)])
         else:
             argv.extend(["--inputs", "random"])
-        argv.extend(["--json", str(report_dir / "check.json")])
+        argv.extend(["--json", str(report_dir / f"check.json")])
         # Flatten in the declared order: each --out, then each --fn with its own bounds.
         for comparison in params["comparisons"]:
             argv.extend(["--out", comparison["out"]])
@@ -859,6 +879,60 @@ def stage_command(stage: dict, context: dict) -> list[str] | None:
     raise TaskValidationError(
         f"stage {stage['stage_id']!r}: a {stage_type} stage is run by the orchestrator, not by argv"
     )
+
+
+def _source_selector(source_id: str) -> str:
+    """Return the ``path:Selector`` string the TileFoundry CLI takes for one source."""
+    entry = SOURCE_REGISTRY[source_id]
+    selector = entry.get("selector")
+    return f"{entry['path']}:{selector}" if selector else entry["path"]
+
+
+def assert_runner_support(spec: dict, *, runner: str = RUNNER_NAME) -> None:
+    """Refuse a spec this runner cannot execute, before any remote call.
+
+    A task can name a stage type or a case that exists in the contract but that this runner
+    has no executor for. Executing the rest and reporting a success would be a claim about
+    work that never happened, so such a spec is rejected here instead: the caller learns
+    which piece is unsupported while no image has been built and no GPU allocated.
+
+    Args:
+        spec: A spec returned by :func:`validate_task`.
+        runner: The driver that will execute it.
+
+    Raises:
+        TaskValidationError: Naming every stage this runner cannot run.
+    """
+    unsupported = sorted({stage["type"] for stage in spec["stages"]} - RUNNER_STAGE_TYPES)
+    if unsupported:
+        raise TaskValidationError(
+            f"the {runner!r} runner cannot execute stage type(s) {unsupported}; it executes "
+            f"{sorted(RUNNER_STAGE_TYPES)}. Remove those stages or run the task with a runner "
+            "that implements them"
+        )
+    foreign = [
+        (stage["stage_id"], stage["params"]["case_id"])
+        for stage in spec["stages"]
+        if stage["type"] in GPU_STAGE_TYPES
+        and CASE_REGISTRY[stage["params"]["case_id"]]["runner"] != runner
+    ]
+    if foreign:
+        stage_id, case_id = foreign[0]
+        owner = CASE_REGISTRY[case_id]["runner"]
+        raise TaskValidationError(
+            f"stages[{stage_id}].params.case_id: {case_id!r} is executed by the {owner!r} "
+            f"runner, not by {runner!r}, so this runner cannot run it"
+        )
+
+
+def task_stage_ids(spec: dict) -> list[str]:
+    """Return the stage ids of *spec* in execution order."""
+    return [stage["stage_id"] for stage in spec["stages"]]
+
+
+def expected_outcome(spec: dict, stage_id: str) -> dict:
+    """Return the declared expectation for one stage of *spec*."""
+    return spec["expected_outcomes"][stage_id] if stage_id in spec["expected_outcomes"] else {"outcome": "pass", "negative": False}
 
 
 def runner_inventory() -> dict:

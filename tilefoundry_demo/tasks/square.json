@@ -1,32 +1,74 @@
 {
   "schema_version": 1,
   "task_id": "square",
-  "description": "Analyze the registered H200 HIR fixture and execute the upstream square case on one H200.",
-  "source_snapshot": {"mode": "local", "expected_sha256": null},
+  "description": "Analyze the registered H200 HIR model and execute the upstream square TIR case on one H200.",
+  "source_snapshot": {
+    "mode": "local",
+    "expected_sha256": null
+  },
   "target": "nvidia.h200_sxm",
-  "gpu": {"type": "H200", "count": 1},
+  "gpu": {
+    "type": "H200",
+    "count": 1
+  },
   "stages": [
-    {"stage_id": "environment", "type": "environment", "params": {}},
+    {
+      "stage_id": "environment",
+      "type": "environment",
+      "params": {}
+    },
     {
       "stage_id": "analyze",
       "type": "hir_analyze",
       "params": {
-        "source_id": "square_hir",
-        "analyses": ["compute-cost", "memory"],
+        "source_id": "h200_model",
+        "analyses": [
+          "compute-cost",
+          "memory"
+        ],
         "dims": {}
       }
     },
-    {"stage_id": "square", "type": "gpu_test", "params": {"case_id": "upstream_square"}},
-    {"stage_id": "archive", "type": "archive", "params": {}}
+    {
+      "stage_id": "square",
+      "type": "gpu_test",
+      "params": {
+        "case_id": "upstream_square"
+      }
+    },
+    {
+      "stage_id": "archive",
+      "type": "archive",
+      "params": {}
+    }
   ],
   "inputs": [],
   "expected_outcomes": {
-    "environment": {"outcome": "pass", "negative": false},
-    "analyze": {"outcome": "pass", "negative": false},
-    "square": {"outcome": "pass", "negative": false},
-    "archive": {"outcome": "pass", "negative": false}
+    "environment": {
+      "outcome": "pass",
+      "negative": false
+    },
+    "analyze": {
+      "outcome": "pass",
+      "negative": false
+    },
+    "square": {
+      "outcome": "pass",
+      "negative": false
+    },
+    "archive": {
+      "outcome": "pass",
+      "negative": false
+    }
   },
-  "artifacts": {"include": ["logs", "results", "generated"], "required": []},
+  "artifacts": {
+    "include": [
+      "logs",
+      "results",
+      "generated"
+    ],
+    "required": []
+  },
   "limits": {
     "cpu_seconds": 1800,
     "gpu_seconds": 600,

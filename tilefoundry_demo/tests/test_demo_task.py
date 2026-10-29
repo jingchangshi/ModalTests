@@ -37,7 +37,7 @@ def minimal_spec() -> dict:
             {
                 "stage_id": "analyze",
                 "type": "hir_analyze",
-                "params": {"source_id": "square_hir", "analyses": ["memory"], "dims": {}},
+                "params": {"source_id": "h200_model", "analyses": ["memory"], "dims": {}},
             },
             {"stage_id": "square", "type": "gpu_test", "params": {"case_id": "upstream_square"}},
             {"stage_id": "archive", "type": "archive", "params": {}},
@@ -332,7 +332,7 @@ def test_rejects_a_cpu_stage_after_a_gpu_stage() -> None:
         {
             "stage_id": "analyze_late",
             "type": "hir_analyze",
-            "params": {"source_id": "square_hir", "analyses": ["memory"], "dims": {}},
+            "params": {"source_id": "h200_model", "analyses": ["memory"], "dims": {}},
         },
     )
     with pytest.raises(demo_task.TaskValidationError) as caught:
@@ -368,7 +368,7 @@ def test_rejects_missing_predicate_bounds(comparisons: list, message: str) -> No
         "stage_id": "check",
         "type": "hir_check",
         "params": {
-            "source_id": "square_hir",
+            "source_id": "h200_model",
             "input_ids": [],
             "comparisons": comparisons,
             "dims": {},
@@ -464,7 +464,7 @@ def test_the_check_argv_keeps_the_declared_comparison_order() -> None:
         "stage_id": "check",
         "type": "hir_check",
         "params": {
-            "source_id": "square_hir",
+            "source_id": "h200_model",
             "input_ids": [],
             "comparisons": [
                 {"out": "output[0]", "predicates": [{"fn": "equal", "bounds": {}}]},
@@ -497,10 +497,14 @@ def test_the_analyze_argv_is_built_from_the_registry() -> None:
     assert argv[:4] == [
         "tilefoundry",
         "analyze",
-        demo_task.SOURCE_REGISTRY["square_hir"]["path"],
+        demo_task._source_selector("h200_model"),
         "/report/analysis.json",
     ]
-    assert "--analysis" in argv and "memory" in argv
+    assert demo_task.SOURCE_REGISTRY["h200_model"]["path"] in argv[2]
+    # Each analysis is its own flag; the CLI has no ``--analysis NAME`` option, so the
+    # old argv was a usage error.
+    assert "--memory" in argv
+    assert "--analysis" not in argv
 
 
 def test_no_stage_command_is_built_for_environment_or_archive() -> None:

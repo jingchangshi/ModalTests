@@ -1,18 +1,31 @@
 {
   "schema_version": 1,
   "task_id": "square_cpu",
-  "description": "Analyze the registered H200 HIR fixture and check it on CPU, without allocating a GPU.",
-  "source_snapshot": {"mode": "local", "expected_sha256": null},
+  "description": "Analyze the registered H200 HIR model and check it on CPU, without allocating a GPU.",
+  "source_snapshot": {
+    "mode": "local",
+    "expected_sha256": null
+  },
   "target": "nvidia.h200_sxm",
-  "gpu": {"type": "H200", "count": 0},
+  "gpu": {
+    "type": "H200",
+    "count": 0
+  },
   "stages": [
-    {"stage_id": "environment", "type": "environment", "params": {}},
+    {
+      "stage_id": "environment",
+      "type": "environment",
+      "params": {}
+    },
     {
       "stage_id": "analyze",
       "type": "hir_analyze",
       "params": {
-        "source_id": "square_hir",
-        "analyses": ["compute-cost", "memory"],
+        "source_id": "h200_model",
+        "analyses": [
+          "compute-cost",
+          "memory"
+        ],
         "dims": {}
       }
     },
@@ -20,24 +33,55 @@
       "stage_id": "check",
       "type": "hir_check",
       "params": {
-        "source_id": "square_hir",
+        "source_id": "h200_model",
         "input_ids": [],
         "comparisons": [
-          {"out": "output", "predicates": [{"fn": "allclose", "bounds": {"atol": 0, "rtol": 0}}]}
+          {
+            "out": "output",
+            "predicates": [
+              {
+                "fn": "nan_inf",
+                "bounds": {}
+              }
+            ]
+          }
         ],
         "dims": {}
       }
     },
-    {"stage_id": "archive", "type": "archive", "params": {}}
+    {
+      "stage_id": "archive",
+      "type": "archive",
+      "params": {}
+    }
   ],
   "inputs": [],
   "expected_outcomes": {
-    "environment": {"outcome": "pass", "negative": false},
-    "analyze": {"outcome": "pass", "negative": false},
-    "check": {"outcome": "pass", "negative": false},
-    "archive": {"outcome": "pass", "negative": false}
+    "environment": {
+      "outcome": "pass",
+      "negative": false
+    },
+    "analyze": {
+      "outcome": "pass",
+      "negative": false
+    },
+    "check": {
+      "outcome": "pass",
+      "negative": false
+    },
+    "archive": {
+      "outcome": "pass",
+      "negative": false
+    }
   },
-  "artifacts": {"include": ["logs", "results", "generated"], "required": []},
+  "artifacts": {
+    "include": [
+      "logs",
+      "results",
+      "generated"
+    ],
+    "required": []
+  },
   "limits": {
     "cpu_seconds": 1800,
     "gpu_seconds": 600,

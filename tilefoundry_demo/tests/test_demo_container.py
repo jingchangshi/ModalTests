@@ -20,6 +20,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import demo_container  # noqa: E402
 import demo_report  # noqa: E402
+import demo_task  # noqa: E402
+
+DEMO_ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture()
@@ -34,8 +37,57 @@ def fake_source(tmp_path: Path) -> Path:
     return root
 
 
-def test_analysis_command_targets_the_shipped_hir_fixture(fake_source: Path, tmp_path: Path) -> None:
-    """The analysis stage runs the documented CLI form, from the source root."""
+def _spec(**overrides) -> dict:
+    """A validated CPU task, so the orchestration tests exercise the real contract."""
+    spec = {
+        "schema_version": 1,
+        "task_id": "square_cpu",
+        "description": "analyze and check on CPU",
+        "source_snapshot": {"mode": "local", "expected_sha256": None},
+        "target": "nvidia.h200_sxm",
+        "gpu": {"type": "H200", "count": 0},
+        "stages": [
+            {"stage_id": "environment", "type": "environment", "params": {}},
+            {
+                "stage_id": "analyze",
+                "type": "hir_analyze",
+                "params": {"source_id": "h200_model", "analyses": ["compute-cost", "memory"], "dims": {}},
+            },
+            {
+                "stage_id": "check",
+                "type": "hir_check",
+                "params": {
+                    "source_id": "h200_model",
+                    "input_ids": [],
+                    "comparisons": [{"out": "output", "predicates": [{"fn": "nan_inf", "bounds": {}}]}],
+                    "dims": {},
+                },
+            },
+            {"stage_id": "archive", "type": "archive", "params": {}},
+        ],
+        "inputs": [],
+        "expected_outcomes": {},
+        "artifacts": {"include": ["logs", "results", "generated"], "required": []},
+        "limits": dict(demo_task.DEFAULT_LIMITS),
+    }
+    spec.update(overrides)
+    return demo_task.validate_task(spec)
+
+
+def _cpu_task() -> dict:
+    """The validated CPU task an orchestration payload carries."""
+    return _spec()
+
+
+def _gpu_task() -> dict:
+    """The validated GPU task the shipped spec defines, as a payload carries it."""
+    return demo_task.validate_task(
+        demo_task.load_task(str(DEMO_ROOT / "tasks" / "square.json"))
+    )
+
+
+def test_analysis_command_targets_the_declared_source(fake_source: Path, tmp_path: Path) -> None:
+    """The analyze stage runs the argv the task definition produced, from the source root."""
     seen = {}
 
     def fake_run(command, *, cwd, log, env=None):
@@ -45,26 +97,44 @@ def test_analysis_command_targets_the_shipped_hir_fixture(fake_source: Path, tmp
         Path(log).write_text("stub\n")
         return 0
 
+    spec = _spec()
+    analyze = spec["stages"][1]
+    argv = demo_task.stage_command(analyze, {"report_dir": tmp_path / "results", "inputs": {}})
     original = demo_container._run_command
     demo_container._run_command = fake_run
     try:
-        demo_container.run_analysis(fake_source, tmp_path / "results", tmp_path / "logs")
+        demo_container.run_analysis(
+            fake_source,
+            tmp_path / "results",
+            tmp_path / "logs",
+            argv=argv,
+            analyses=analyze["params"]["analyses"],
+        )
     finally:
         demo_container._run_command = original
 
     command = seen["command"]
-    assert command[1:4] == ["-m", "tilefoundry.cli", "analyze"]
-    assert command[4] == "tests/nvidia/cuda/fixtures/cli/products/h200_sxm.py:Model"
+    assert command[:3] == ["tilefoundry", "analyze", demo_task._source_selector("h200_model")]
     assert "--compute-cost" in command and "--memory" in command and "--json" in command
+    assert "--analysis" not in command
     assert seen["cwd"] == fake_source
 
 
 def test_analysis_missing_report_is_recorded_not_raised(fake_source: Path, tmp_path: Path) -> None:
     """A zero exit code with no report is evidence of a gap, not an exception."""
+    spec = _spec()
+    analyze = spec["stages"][1]
+    argv = demo_task.stage_command(analyze, {"report_dir": tmp_path / "results", "inputs": {}})
     original = demo_container._run_command
     demo_container._run_command = lambda *args, **kwargs: 0
     try:
-        analysis = demo_container.run_analysis(fake_source, tmp_path / "results", tmp_path / "logs")
+        analysis = demo_container.run_analysis(
+            fake_source,
+            tmp_path / "results",
+            tmp_path / "logs",
+            argv=argv,
+            analyses=analyze["params"]["analyses"],
+        )
     finally:
         demo_container._run_command = original
     assert analysis["json_ok"] is False
@@ -77,7 +147,7 @@ def test_analysis_reads_back_the_executed_analyses(fake_source: Path, tmp_path: 
     results.mkdir()
 
     def fake_run(command, *, cwd, log, env=None):
-        Path(command[5]).write_text(
+        Path(command[3]).write_text(
             json.dumps(
                 {
                     "target": "nvidia.h200_sxm",
@@ -91,15 +161,61 @@ def test_analysis_reads_back_the_executed_analyses(fake_source: Path, tmp_path: 
         )
         return 0
 
+    spec = _spec()
+    analyze = spec["stages"][1]
+    argv = demo_task.stage_command(analyze, {"report_dir": results, "inputs": {}})
     original = demo_container._run_command
     demo_container._run_command = fake_run
     try:
-        analysis = demo_container.run_analysis(fake_source, results, tmp_path / "logs")
+        analysis = demo_container.run_analysis(
+            fake_source, results, tmp_path / "logs",
+            argv=argv,
+            analyses=analyze["params"]["analyses"],
+        )
     finally:
         demo_container._run_command = original
     assert analysis["function_count"] == 1
     assert analysis["call_count"] == 1
     assert demo_report.evaluate_analysis(analysis)[0] == demo_report.STATUS_PASS
+
+
+def test_run_check_reads_the_report_it_asked_for(fake_source: Path, tmp_path: Path) -> None:
+    """A check stage is judged by the JSON the CLI wrote, not by its exit code alone."""
+    results = tmp_path / "results"
+    results.mkdir()
+
+    def fake_run(command, *, cwd, log, env=None):
+        Path(command[-1]).write_text(
+            json.dumps(
+                {
+                    "passed": True,
+                    "runs": [
+                        {
+                            "outputs": [
+                                {
+                                    "path": "output",
+                                    "fns": [{"fn": "nan_inf", "nan": 0.0, "inf": 0.0, "passed": True}],
+                                }
+                            ]
+                        }
+                    ],
+                }
+            )
+        )
+        return 0
+
+    spec = _spec()
+    check_stage = spec["stages"][2]
+    argv = demo_task.stage_command(check_stage, {"report_dir": results, "inputs": {}})
+    original = demo_container._run_command
+    demo_container._run_command = fake_run
+    try:
+        check = demo_container.run_check(fake_source, results, tmp_path / "logs", argv=argv)
+    finally:
+        demo_container._run_command = original
+    assert check["json_ok"] is True
+    assert check["passed"] is True
+    assert check["predicates"] == [{"out": "output", "fn": "nan_inf", "passed": True}]
 
 
 def test_cmake_step_needs_a_command_and_a_clean_stderr(tmp_path: Path) -> None:
@@ -138,6 +254,7 @@ def test_run_reports_missing_stages_without_claiming_success(tmp_path: Path, mon
     volume.mkdir()
     payload = {
         "run_id": "test-run",
+        "task": _gpu_task(),
         "snapshot": {
             "commit": "0" * 40,
             "branch": "main",
@@ -178,20 +295,23 @@ def test_run_reports_missing_stages_without_claiming_success(tmp_path: Path, mon
             },
         }
 
-    def fake_analysis(source_root, results_dir, logs_dir):
+    def fake_analysis(source_root, results_dir, logs_dir, *, argv, analyses):
         return {
             "returncode": 0,
             "json_ok": True,
             "executed": ["compute-cost", "memory"],
             "target": "nvidia.h200_sxm",
+            "command": argv[2],
+            "argv": argv,
         }
 
-    def fake_test(source_root, results_dir, logs_dir, dump_root):
+    def fake_test(source_root, results_dir, logs_dir, dump_root, *, node_id):
         return {
             "pytest": {
                 "returncode": 0,
                 "elapsed_seconds": 1.0,
                 "junit": {"tests": 1, "failures": 0, "errors": 0, "skipped": 0},
+                "command": node_id,
             },
             "compile": {
                 "calls": [{"runtime_name": "M.host"}],
@@ -244,6 +364,7 @@ def test_run_fails_when_the_installed_tree_lost_a_selected_file(tmp_path: Path, 
     volume.mkdir()
     payload = {
         "run_id": "drift-run",
+        "task": _cpu_task(),
         "snapshot": {
             "commit": "0" * 40,
             "branch": "main",
