@@ -723,3 +723,62 @@ def test_readme_documents_the_cpu_only_completion_scope() -> None:
             f"README must quote the NOT_RUN reason {reason!r}"
         )
     assert "completion_scope" in readme
+
+
+# ---------------------------------------------------------------------------
+# Documented shell blocks must be copy-pasteable.
+#
+# The machine-path audit checks what a command *says*; it does not check that
+# the block is valid shell. A scripted edit once double-escaped the line
+# continuations in the download example, so the block collapsed into one line
+# containing a literal backslash-n and anyone copying it got a broken command.
+# That is a distinct failure mode from a wrong path, so it gets its own gate.
+# ---------------------------------------------------------------------------
+FENCE = "`" * 3
+FENCED_BLOCK = re.compile(FENCE + r"[^\n]*\n(.*?)" + FENCE, re.S)
+
+
+def _fenced_blocks(text: str) -> list[str]:
+    """Every fenced code block body in a Markdown file."""
+    return FENCED_BLOCK.findall(text)
+
+
+def test_documented_shell_blocks_are_copy_pasteable() -> None:
+    """A documented command block must not carry escaped-newline artefacts."""
+    offenders = []
+    for relative in ("README.md", "../AGENTS.md"):
+        path = DEMO_ROOT / relative
+        if not path.exists():
+            continue
+        for index, body in enumerate(_fenced_blocks(path.read_text(encoding="utf-8"))):
+            # A literal backslash-n inside a fence is what a double-escaped
+            # continuation degrades into once the Markdown is rendered.
+            if "\\n" in body:
+                offenders.append(f"{relative} block {index}: literal backslash-n")
+            # A line ending in two backslashes is the double-escaped form: shell
+            # reads the second backslash as an escaped backslash, not a
+            # continuation, so the next line becomes a separate command.
+            for line in body.splitlines():
+                if line.rstrip().endswith("\\\\"):
+                    offenders.append(
+                        f"{relative} block {index}: doubled line continuation: {line.strip()[:60]}"
+                    )
+    assert not offenders, (
+        "documented shell blocks must be copy-pasteable, so a line continuation is a "
+        f"single backslash and never a literal backslash-n: {offenders}"
+    )
+
+
+def test_the_copy_pasteable_gate_catches_the_escaping_bug() -> None:
+    """The gate must fail on the shape it exists to catch, not just pass vacuously."""
+    doubled = "```bash\nmodal volume get a \\\\n  b \\\\n  c\n```"
+    literal = "```bash\nmodal volume get a " + chr(92) * 2 + "n  b\n```"
+    assert _fenced_blocks(doubled), "the extractor must find a real block"
+    for broken in (doubled, literal):
+        bodies = _fenced_blocks(broken)
+        assert bodies, f"extractor found no block in {broken!r}"
+        caught = any(
+            "\\n" in body or any(line.rstrip().endswith("\\\\") for line in body.splitlines())
+            for body in bodies
+        )
+        assert caught, f"the gate would not have caught {broken!r}"
