@@ -285,16 +285,16 @@ against.
 The run prints the exact command:
 
 ```bash
-modal volume get tilefoundry-artifacts \\
-  runs/<run-id>/tilefoundry-demo-<run-id>.tar.gz \\
+modal volume get tilefoundry-artifacts \
+  runs/<run-id>/tilefoundry-demo-<run-id>.tar.gz \
   ./results/<run-id>/tilefoundry-demo-<run-id>.tar.gz
 ```
 
 Then check the downloaded bundle against the result the run printed:
 
 ```bash
-python verify_bundle.py \\
-  results/<run-id>/tilefoundry-demo-<run-id>.tar.gz \\
+python verify_bundle.py \
+  results/<run-id>/tilefoundry-demo-<run-id>.tar.gz \
   --result results/<run-id>/remote-result.json
 ```
 
@@ -307,7 +307,8 @@ expected test, and the built library and generated CUDA source are present.
 
 ```text
 tilefoundry-demo-<run-id>/
-  manifest.json              # identity, versions, task_stages, per-stage stage_details, digests
+  manifest.json              # identity, versions, the whole task spec, task_stages,
+                             # per-stage stage_details, digests
   results/
     analysis.json            # the HIR report the CLI wrote (hir_analyze stage)
     check.json               # the comparison report (hir_check stage only)
@@ -325,7 +326,9 @@ tilefoundry-demo-<run-id>/
     <test_file>/<test>/build/                         # CMakeLists.txt, module.device_0.cu, cmake logs
     build/                                            # device_0.cu, host.cpp, CMakeLists.txt
       build/                                          # the CMake build tree: lib<TirSquare>.so lives here
-  build/                                              # the stage build root: TMPDIR plus cache/ (TILEFOUNDRY_CACHE_DIR)
+  build/                                              # the stage build root: TMPDIR scratch
+                                                      # (tilefoundry_build_*/, tvm-ffi-*) plus
+                                                      # cache/ when TILEFOUNDRY_CACHE_DIR fills
 ```
 
 On the host, the run writes `results/<run-id>/preflight.json` and
@@ -376,12 +379,12 @@ input would defeat the point of regenerating per run.
 | Symptom | Where to look |
 |---|---|
 | `no TileFoundry checkout was found` | section 4: set `TILEFOUNDRY_REPO` or clone beside this repo |
-| `no-GPU preflight failed` | `results/<run-id>/preflight.json`, then `logs/environment.log` |
-| `analysis_status` is `FAIL` | `logs/analysis.log`; `results/analysis.json` may not exist |
-| `compile_status` is `ERROR` | `logs/compile-and-test.log`, then the `cmake-*.stderr` dumps under `generated/` |
-| `correctness_status` is `FAIL` | `results/test-results.json` → `correctness.comparisons` |
-| a skip reported as `FAIL` | the device was not really a usable H200; check `gpu` in the manifest |
-| `overall_status` is `NOT_RUN` | a stage never executed: read `overall_reason` for the first missing one |
+| `environment` is not `PASS` | `results/<run-id>/preflight.json`, then `logs/environment.log`; a FAIL here means the installed tree drifted from the digested snapshot, not that the GPU is bad |
+| `analyze` is `FAIL` | `logs/analysis.log`; `results/analysis.json` may not exist |
+| `square` / `check` is `ERROR` | `logs/compile-and-test.log`, then the `cmake-*.stderr` dumps under `generated/` |
+| `square` / `check` is `FAIL` | `results/test-results.json` → `correctness.comparisons`; the comparison or the device was not what the stage claims |
+| `square` is `BLOCKED` | no usable CUDA device; check `gpu` and `compute_capability` in the manifest |
+| `overall_status` is `NOT_RUN` | a stage never executed (a `--cpu-only` invocation, for example): read `overall_reason` for the first missing one |
 | `reference generation failed` | no GPU was allocated and no record was written; the message quotes the generator error, and `results/experiments-<run-id>/` is empty because the run stopped before the record |
 
 ## 13 · Local tests (no GPU, no torch, no Modal client)
